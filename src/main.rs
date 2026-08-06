@@ -36,7 +36,7 @@ fn main() {
     let cli = Cli::parse();
     let kind = detect(&cli.text);
 
-    let output = match kind {
+    let output = match &kind {
         ContentKind::Json => match compress_json_array(&cli.text) {
             Some(result) => Output {
                 compressed: result.content,
@@ -85,7 +85,10 @@ fn main() {
                 }
             }
         }
-        ContentKind::PlainText => Output {
+        // Other(_) carries Magika's real classification (rust/html/diff/
+        // csv/markdown/...) for observability — no dedicated compressor
+        // per label yet, so behavior matches PlainText for now.
+        ContentKind::PlainText | ContentKind::Other(_) => Output {
             compressed: dedupe_line_runs(&cli.text),
             source: "dedup",
             detail: String::new(),

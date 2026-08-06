@@ -1,21 +1,45 @@
 //! Classify content by shape so the right compressor gets picked, instead
 //! of always running the same fixed pipeline regardless of what's inside.
 //! Same idea as headroom's ContentRouter detection step — own design.
+//!
+//! Combination strategy (deliberate, not arbitrary): the fast regex/parse
+//! checks run first and are authoritative for Json/SearchResults/Log —
+//! measured against real Magika output and found *more* precise for
+//! these three: Magika labeled a single JSON object "jsonl" and had no
+//! dedicated label for ad-hoc application logs at all (see
+//! examples/probe_magika.rs). Magika only gets consulted for whatever
+//! those checks don't confidently classify — where it's a genuine
+//! improvement over the old blind "PlainText" catch-all (real labels:
+//! rust, html, diff, csv, markdown, ...) at a real cost (~111ms model
+//! load, only paid on this fallback path, never on the fast paths).
 
+use magika::Session;
 use regex::Regex;
 use std::sync::LazyLock;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentKind {
     Json,
     SearchResults,
     Log,
     PlainText,
+    /// Magika's raw label for content that isn't Json/SearchResults/Log
+    /// and isn't generic prose either (e.g. "rust", "html", "diff",
+    /// "csv", "markdown"). No dedicated compressor per label yet —
+    /// callers currently treat this the same as PlainText for
+    /// compression — but the real classification is preserved for
+    /// observability and future routing.
+    Other(String),
 }
 
 static SEARCH_RESULT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\S+:\d+:").unwrap());
 static LOG_LEVEL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(error|warn(ing)?|fatal|fail(ed)?)\b").unwrap());
+
+/// Magika's label for generic, structureless text — mapped to
+/// ContentKind::PlainText rather than Other("txt"), since that's exactly
+/// what PlainText already means.
+const MAGIKA_PLAIN_TEXT_LABEL: &str = "txt";
 
 pub fn detect(content: &str) -> ContentKind {
     let trimmed = content.trim_start();
@@ -42,7 +66,19 @@ pub fn detect(content: &str) -> ContentKind {
         }
     }
 
-    ContentKind::PlainText
+    match magika_label(content) {
+        Some(label) if label == MAGIKA_PLAIN_TEXT_LABEL => ContentKind::PlainText,
+        Some(label) => ContentKind::Other(label),
+        // Magika unavailable/failed — don't hard-fail detection over an
+        // optional enrichment signal, fall back to the old behavior.
+        None => ContentKind::PlainText,
+    }
+}
+
+fn magika_label(content: &str) -> Option<String> {
+    let mut session = Session::new().ok()?;
+    let result = session.identify_content_sync(content.as_bytes()).ok()?;
+    Some(result.info().label.to_string())
 }
 
 #[cfg(test)]
@@ -72,15 +108,39 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_plain_text() {
+    fn malformed_json_like_content_falls_through() {
+        // starts with { but isn't valid JSON — must not misclassify.
+        // Also not log/search-shaped, so this exercises the Magika
+        // fallback path for real.
+        let content = "{ this is not json, just a sentence with a brace }";
+        let kind = detect(content);
+        assert!(
+            kind == ContentKind::PlainText || matches!(kind, ContentKind::Other(_)),
+            "expected PlainText or Other(_), got {kind:?}"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_plain_text_for_generic_prose() {
         let content = "just a normal paragraph of prose with no special structure.";
         assert_eq!(detect(content), ContentKind::PlainText);
     }
 
     #[test]
-    fn malformed_json_like_content_falls_through() {
-        // starts with { but isn't valid JSON — must not misclassify.
-        let content = "{ this is not json, just a sentence with a brace }";
-        assert_eq!(detect(content), ContentKind::PlainText);
+    fn classifies_rust_source_via_magika() {
+        let content = "fn main() {\n    let x = 5;\n    println!(\"{}\", x);\n}\n";
+        assert_eq!(detect(content), ContentKind::Other("rust".to_string()));
+    }
+
+    #[test]
+    fn classifies_html_via_magika() {
+        let content = "<html><head><title>Test</title></head><body><h1>Hi</h1></body></html>";
+        assert_eq!(detect(content), ContentKind::Other("html".to_string()));
+    }
+
+    #[test]
+    fn classifies_diff_via_magika() {
+        let content = "diff --git a/src/main.rs b/src/main.rs\nindex abc..def 100644\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,3 +1,3 @@\n-let x = 5;\n+let x = 10;\n";
+        assert_eq!(detect(content), ContentKind::Other("diff".to_string()));
     }
 }

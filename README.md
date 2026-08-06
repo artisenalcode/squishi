@@ -34,13 +34,32 @@ Detects content shape (`content_detect`) and routes:
   the rest.
 - **Everything else** (`line_dedup`) — collapses runs of >5 identical
   consecutive lines. Safe, lossless-in-spirit; never destroys
-  non-repeating structure.
+  non-repeating structure. Content that doesn't match Json/SearchResults/
+  Log gets a real sub-classification via `magika` (rust/html/diff/csv/
+  markdown/... — see below) rather than a blind "PlainText" label, even
+  though compression behavior is the same dedup-only pass for now.
 
 `log_compress` and the router shape were arrived at by reading
 `headroom`'s ContentRouter/LogCompressor mechanism (classify → score →
 select → format) to understand *why* it gets real compression, then
 implementing squishi's own version in plain Rust — no Python, no venv,
 no external process for any of the above.
+
+### Detection: regex first, Magika as fallback — deliberately, not arbitrarily
+
+The fast regex/parse checks (Json/SearchResults/Log) run first and are
+authoritative — measured against real Magika output and found *more*
+precise for these three: Magika labeled a single compact JSON object
+`"jsonl"` and had no dedicated label for ad-hoc application logs at all
+(fell back to `"txt"`). Magika only gets consulted when those checks
+find nothing — where it's a genuine upgrade over the old blind
+`PlainText` catch-all: real file-type labels (rust, html, diff, csv,
+markdown, ...) instead of one undifferentiated bucket.
+
+Cost: ~111ms to load the model (`google/magika`'s official Rust crate —
+3.1MB, bundled directly in the crate, zero network calls, unlike
+Kompress's on-demand download) plus ~28ms/classification — only paid on
+the fallback path, never on content the regex checks already classified.
 
 Prints `{"compressed", "kind", "source", "chars_before", "chars_after",
 ...}` (extra fields vary by which compressor ran).
@@ -69,6 +88,20 @@ use case shows up — the module, its tests (`#[ignore]`d by default, run
 explicitly with `cargo test -- --ignored`), and the verification probes
 (`examples/probe_kompress.rs`, `examples/probe_tokenizer.rs`,
 `examples/probe_scores.rs`) stay in the repo either way.
+
+Two real levers if this gets revisited, neither tried yet: `ort`'s
+`with_optimized_model_path` (serialize the post-optimization graph once,
+skip re-optimizing on every cold start) as a no-daemon fix, or a
+long-running process that loads the session once and serves requests
+over a local socket — the standard fix for "expensive load, cheap
+inference," but a real architecture change (squishi stops being a
+stateless one-shot CLI).
+
+`ort` is pinned to `=2.0.0-rc.12` (was `=2.0.0-rc.13`) — `magika` hard-
+pins `rc.12` even on its latest unreleased source, and `[patch]` can't
+bypass an exact pin from the same registry without forking. Confirmed
+API-compatible for everything squishi uses (`kompress.rs` needed zero
+changes), so this was the pragmatic fix over forking.
 
 ## Remembered: the total-recall-kit ruleset (not built yet)
 
