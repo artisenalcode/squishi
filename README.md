@@ -1,37 +1,74 @@
 # squishi
 
-Rust-native text compressor. Pure functions, zero dependencies beyond
-`clap`/`regex`, no subprocess, no network, no storage.
+Rust-native text compressor. Detects content shape, routes to the
+matching technique. No subprocess for its default path, no network, no
+storage.
 
 ## Boundary
 
 squishi compresses text. It does not store or retrieve anything — that's
-`total-recall`'s job (formerly `mf`, `~/Code/_labs/mindforge/total-recall`).
-Don't add a cache, a database, or a retrieval marker here; if a caller
-needs to get back what was compressed away, that's a `total-recall` bank
-entry, not squishi's concern.
+`total-recall`'s job (formerly `mf`, `~/Code/_labs/total-recall`, now its
+own standalone repo). Don't add a cache, a database, or a retrieval
+marker here; if a caller needs to get back what was compressed away,
+that's a `total-recall` bank entry, not squishi's concern.
 
 ## What it does today
-
-- `line_dedup` — collapse runs of >5 identical consecutive lines. Safe,
-  lossless-in-spirit pre-pass; never destroys non-repeating structure.
-- `log_compress` — classify each line (error/warn/info), score it, keep
-  errors/warnings (first + last + highest-scoring middle, capped),
-  summary lines (`=== N passed/failed ===` etc.), and context around each
-  kept line. Emits `[N lines omitted: X error, Y warn]` for the rest.
-
-Both arrived at by reading `headroom`'s LogCompressor mechanism (classify
-→ score → select → format) to understand *why* it gets real compression
-on repetitive logs, then implementing squishi's own version in plain
-Rust — no Python, no venv, no external process.
 
 ```bash
 squishi compress "<text>"
 ```
 
-Pipeline: dedup first (free); if still over ~2000 chars, run log_compress
-on the deduped text. Prints `{"compressed", "source", "chars_before",
-"chars_after"}`.
+Detects content shape (`content_detect`) and routes:
+
+- **JSON** (`json_compress`) — dedupes exact-duplicate array elements,
+  caps large arrays to first-5 + last-5 + a dropped-count marker. A
+  single object (nothing repeatable) passes through unchanged.
+- **Search results** (`search_compress`) — groups grep/ripgrep-style
+  `path:line:text` output by file, caps to 5 matches/file with an
+  omitted-count marker, preserves per-file grouping even when input is
+  interleaved.
+- **Log/build output** (`log_compress`) — classifies each line
+  (error/warn/info/summary), scores it, keeps errors/warnings (first +
+  last + highest-scoring middle, capped) plus summary lines and context
+  around each kept line. Emits `[N lines omitted: X error, Y warn]` for
+  the rest.
+- **Everything else** (`line_dedup`) — collapses runs of >5 identical
+  consecutive lines. Safe, lossless-in-spirit; never destroys
+  non-repeating structure.
+
+`log_compress` and the router shape were arrived at by reading
+`headroom`'s ContentRouter/LogCompressor mechanism (classify → score →
+select → format) to understand *why* it gets real compression, then
+implementing squishi's own version in plain Rust — no Python, no venv,
+no external process for any of the above.
+
+Prints `{"compressed", "kind", "source", "chars_before", "chars_after",
+...}` (extra fields vary by which compressor ran).
+
+## `kompress` — real, tested, not wired in
+
+`src/kompress.rs` is a native Rust port of headroom's Kompress: a
+learned per-word keep/drop classifier (ModernBERT,
+`chopratejas/kompress-v2-base`, downloaded via `hf-hub` + run locally via
+`ort`/ONNX Runtime — the same stack `total-recall`'s embeddings already
+prove out, just applied to a different model). Correctness-verified
+against the real ONNX I/O contract (not assumed from headroom's Python
+source) and against real content: on genuinely filler-heavy prose it
+gets real, meaningful compression (412 words → 327, keeping content
+words, dropping "that"/"of"/"a"-type filler).
+
+**Deliberately not wired into the default `compress` path.** Every
+invocation is a fresh process with no state to reuse, so every call pays
+the full ONNX session-load cost from scratch — measured at ~7.4s just to
+load, before any inference. That's fine for `line_dedup`/`log_compress`/
+etc. (all complete in milliseconds) but not worth triggering for
+`compress`'s default path, and not worth an unconditional model download
+baked into normal usage. A daemon architecture would amortize the load
+cost across calls; nothing here needs that yet. Revisit if/when a real
+use case shows up — the module, its tests (`#[ignore]`d by default, run
+explicitly with `cargo test -- --ignored`), and the verification probes
+(`examples/probe_kompress.rs`, `examples/probe_tokenizer.rs`,
+`examples/probe_scores.rs`) stay in the repo either way.
 
 ## Remembered: the total-recall-kit ruleset (not built yet)
 
@@ -63,7 +100,8 @@ or `log_compress`.
 ## Development
 
 ```bash
-cargo test
+cargo test                    # fast — kompress's real-model tests are #[ignore]d
+cargo test -- --ignored       # slow — downloads/runs the real kompress model
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```

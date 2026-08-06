@@ -1,15 +1,18 @@
-mod content_detect;
-mod json_compress;
-mod line_dedup;
-mod log_compress;
-mod search_compress;
-
 use clap::Parser;
-use content_detect::{ContentKind, detect};
-use json_compress::compress_json_array;
-use line_dedup::dedupe_line_runs;
-use log_compress::{LogCompressConfig, compress_log};
-use search_compress::compress_search_results;
+use squishi::content_detect::{ContentKind, detect};
+use squishi::json_compress::compress_json_array;
+use squishi::line_dedup::dedupe_line_runs;
+use squishi::log_compress::{LogCompressConfig, compress_log};
+use squishi::search_compress::compress_search_results;
+
+// kompress (src/kompress.rs) is deliberately NOT wired in here. It's real,
+// tested, and correctness-verified (word-level keep/drop, matches
+// headroom's algorithm), but every invocation pays a ~7-18s ONNX
+// session-load cost with no state to reuse between one-shot CLI calls —
+// not worth triggering an unconditional model download for every
+// PlainText compress until there's an actual use case that justifies
+// that cost (a daemon architecture would amortize it; nothing here needs
+// that yet). Revisit if/when that use case shows up.
 
 #[derive(Parser)]
 #[command(
