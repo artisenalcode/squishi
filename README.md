@@ -15,10 +15,29 @@ that's a `total-recall` bank entry, not squishi's concern.
 ## What it does today
 
 ```bash
-squishi compress "<text>"
+squishi "<text>"
+cat file | squishi          # or pipe via stdin — no shell-argument size limit
 ```
 
-Detects content shape (`content_detect`) and routes:
+Every call first runs a zero-model, unconditional pre-pass
+(`base64_strip`) that strips base64-encoded blobs — inline data-URIs
+and long standalone base64 runs — before shape detection even runs.
+Not a `ContentKind` of its own: a blob can appear inside JSON, logs,
+diffs, or plain text alike, the same way MCE's `Layer1Pruner` runs
+ahead of its shape-aware routing (audited `~/Code/_labs/audit-repos/MCE`,
+2026-08-07 — squishi had no base64 handling at all before this). A
+matched blob is replaced with `[... squishi pruned: base64 blob
+removed, N chars ...]`; `--json` output reports `base64_blobs_removed`
+when anything was stripped. Two thresholds, calibrated against real
+fixtures, not guessed: a `data:...;base64,`-prefixed blob only needs
+20 chars of payload to count (the prefix itself is the high-confidence
+signal); an unprefixed standalone run needs 500+ chars — found by
+testing a real JWT, whose ~200-char base64url payload segment matched
+and was wrongly stripped at an earlier, lower threshold before this
+was raised.
+
+Then, `content_detect` classifies the (now blob-stripped) content shape
+and routes:
 
 - **JSON** (`json_compress`) — dedupes exact-duplicate array elements,
   caps large arrays to first-5 + last-5 + a dropped-count marker. A

@@ -1,5 +1,6 @@
 use clap::Parser;
 use serde_json::{Map, Value};
+use squishi::base64_strip::strip_base64_blobs;
 use squishi::content_detect::{ContentKind, detect};
 use squishi::diff_compress::{DiffCompressConfig, compress_diff};
 use squishi::json_compress::compress_json_array;
@@ -50,6 +51,14 @@ struct Output {
 /// and it had zero direct test coverage before this existed only inline
 /// in `main()`.
 fn route(text: &str) -> (ContentKind, Output) {
+    // Unconditional pre-pass, not a ContentKind of its own — a base64 blob
+    // (an embedded screenshot, a data-URI) can appear inside any shape
+    // detect() classifies below, so it's stripped before detection runs,
+    // the same way MCE's Layer1Pruner runs ahead of its shape-aware
+    // routing (audited 2026-08-07, see docs/plan-2026-08-07-base64-strip.md).
+    let (text, base64_blobs_removed) = strip_base64_blobs(text);
+    let text = text.as_str();
+
     let kind = detect(text);
 
     let output = match &kind {
@@ -191,6 +200,14 @@ fn route(text: &str) -> (ContentKind, Output) {
         },
     };
 
+    let mut output = output;
+    if base64_blobs_removed > 0 {
+        output.detail.insert(
+            "base64_blobs_removed".to_string(),
+            Value::from(base64_blobs_removed),
+        );
+    }
+
     (kind, output)
 }
 
@@ -278,6 +295,38 @@ mod tests {
         assert_eq!(output.source, "json-passthrough");
         assert_eq!(output.compressed, input);
         assert!(output.detail.is_empty());
+    }
+
+    #[test]
+    fn a_base64_blob_inside_json_is_stripped_and_stays_valid_json() {
+        let blob = "A".repeat(500);
+        let input = format!(r#"{{"image": "{blob}", "name": "test"}}"#);
+        let (kind, output) = route(&input);
+        assert_eq!(kind, ContentKind::Json);
+        assert_eq!(output.detail["base64_blobs_removed"], Value::from(1));
+        let parsed: Value = serde_json::from_str(&output.compressed)
+            .expect("compressed output should still be valid JSON");
+        assert_eq!(parsed["name"], "test");
+        assert!(parsed["image"].as_str().unwrap().contains("squishi pruned"));
+    }
+
+    #[test]
+    fn a_base64_blob_in_plain_text_is_reported_in_json_output() {
+        let blob = "A".repeat(500);
+        let input = format!("here is a blob: {blob} end");
+        let (kind, output) = route(&input);
+        assert_eq!(kind, ContentKind::PlainText);
+        assert_eq!(output.detail["base64_blobs_removed"], Value::from(1));
+        assert!(!output.compressed.contains(&blob));
+    }
+
+    #[test]
+    fn content_with_no_base64_has_no_base64_blobs_removed_key() {
+        let (_, output) = route("just a normal paragraph of prose with no special structure.");
+        assert!(
+            !output.detail.contains_key("base64_blobs_removed"),
+            "base64_blobs_removed should be absent, not zero, when nothing was stripped"
+        );
     }
 
     #[test]

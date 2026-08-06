@@ -1,3 +1,4 @@
+pub mod base64_strip;
 pub mod content_detect;
 pub mod diff_compress;
 pub mod json_compress;
