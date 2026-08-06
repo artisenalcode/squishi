@@ -1,4 +1,5 @@
 use clap::Parser;
+use serde::Serialize;
 use serde_json::{Map, Value};
 use squishi::content_detect::{ContentKind, detect};
 use squishi::diff_compress::{DiffCompressConfig, compress_diff};
@@ -183,36 +184,45 @@ fn route(text: &str) -> (ContentKind, Output) {
     (kind, output)
 }
 
+/// The CLI's full JSON output contract — governator's `squishi.rs` wrapper
+/// depends on exactly these top-level fields (plus whatever `detail`
+/// flattens in). One typed, serializable shape instead of hand-built
+/// `Map`/`Value` construction duplicated between `main` and its tests.
+#[derive(Serialize)]
+struct CliOutput {
+    compressed: String,
+    kind: String,
+    source: &'static str,
+    chars_before: usize,
+    chars_after: usize,
+    #[serde(flatten)]
+    detail: Map<String, Value>,
+}
+
+fn build_output(text: &str, kind: &ContentKind, output: Output) -> CliOutput {
+    CliOutput {
+        chars_before: text.len(),
+        chars_after: output.compressed.len(),
+        compressed: output.compressed,
+        kind: format!("{kind:?}"),
+        source: output.source,
+        detail: output.detail,
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     let (kind, output) = route(&cli.text);
-
-    let mut json = Map::new();
-    json.insert(
-        "compressed".to_string(),
-        Value::from(output.compressed.clone()),
+    let cli_output = build_output(&cli.text, &kind, output);
+    println!(
+        "{}",
+        serde_json::to_string(&cli_output).expect("CliOutput is always serializable")
     );
-    json.insert("kind".to_string(), Value::from(format!("{kind:?}")));
-    json.insert("source".to_string(), Value::from(output.source));
-    json.insert("chars_before".to_string(), Value::from(cli.text.len()));
-    json.insert(
-        "chars_after".to_string(),
-        Value::from(output.compressed.len()),
-    );
-    for (k, v) in output.detail {
-        json.insert(k, v);
-    }
-
-    println!("{}", Value::Object(json));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn detail_str<'a>(v: &'a Value, key: &str) -> &'a str {
-        v.get(key).and_then(Value::as_str).unwrap()
-    }
 
     #[test]
     fn json_array_routes_to_json_compressor() {
@@ -309,26 +319,16 @@ mod tests {
 
     #[test]
     fn top_level_output_is_valid_json_with_expected_fields() {
-        let (kind, output) = route(r#"[{"a":1},{"a":1}]"#);
-        let mut json = Map::new();
-        json.insert(
-            "compressed".to_string(),
-            Value::from(output.compressed.clone()),
-        );
-        json.insert("kind".to_string(), Value::from(format!("{kind:?}")));
-        json.insert("source".to_string(), Value::from(output.source));
-        json.insert("chars_before".to_string(), Value::from(2usize));
-        json.insert(
-            "chars_after".to_string(),
-            Value::from(output.compressed.len()),
-        );
-        for (k, v) in output.detail {
-            json.insert(k, v);
-        }
-        let value = Value::Object(json);
-        assert_eq!(detail_str(&value, "kind"), "Json");
-        assert_eq!(detail_str(&value, "source"), "json");
-        assert!(value.get("chars_before").unwrap().is_u64());
+        let text = r#"[{"a":1},{"a":1}]"#;
+        let (kind, output) = route(text);
+        let cli_output = build_output(text, &kind, output);
+        let serialized = serde_json::to_string(&cli_output).unwrap();
+        let value: Value = serde_json::from_str(&serialized).expect("must be valid JSON");
+
+        assert_eq!(value["kind"], "Json");
+        assert_eq!(value["source"], "json");
+        assert!(value["chars_before"].is_u64());
+        assert!(value["elements_before"].is_u64());
     }
 
     #[test]
@@ -340,10 +340,9 @@ mod tests {
             the plain-text threshold so dedup runs and this string round-trips through \
             the actual compression path rather than a trivial passthrough, which is the \
             realistic case this test needs to cover for real adversarial content handling.";
-        let (_, output) = route(input);
-        let mut json = Map::new();
-        json.insert("compressed".to_string(), Value::from(output.compressed));
-        let serialized = Value::Object(json).to_string();
+        let (kind, output) = route(input);
+        let cli_output = build_output(input, &kind, output);
+        let serialized = serde_json::to_string(&cli_output).unwrap();
         let reparsed: Value = serde_json::from_str(&serialized).expect("must be valid JSON");
         assert!(reparsed["compressed"].as_str().unwrap().contains("quoted"));
     }
