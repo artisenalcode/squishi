@@ -1,0 +1,62 @@
+{
+  "examples/probe_magika.rs": {
+    "mtime": 1785977568.449376,
+    "ast_hash": "dfd52154dd675e99c30104a270e36708",
+    "semantic_hash": "dfd52154dd675e99c30104a270e36708"
+  },
+  "examples/probe_optimized_cache.rs": {
+    "mtime": 1785980538.094024,
+    "ast_hash": "5cde1d4abc76e4cdc9b4c5d8963ada82",
+    "semantic_hash": "5cde1d4abc76e4cdc9b4c5d8963ada82"
+  },
+  "examples/probe_single_load.rs": {
+    "mtime": 1785980538.096024,
+    "ast_hash": "2df19474e64f3fa1c686a1ed2779989c",
+    "semantic_hash": "2df19474e64f3fa1c686a1ed2779989c"
+  },
+  "src/content_detect.rs": {
+    "mtime": 1785983315.7308757,
+    "ast_hash": "39b6ec7a8ede96186add0388ef652618",
+    "semantic_hash": "39b6ec7a8ede96186add0388ef652618"
+  },
+  "src/diff_compress.rs": {
+    "mtime": 1785983337.7400954,
+    "ast_hash": "2a6b0566ee0f41d06b91ba4cdadafa75",
+    "semantic_hash": "2a6b0566ee0f41d06b91ba4cdadafa75"
+  },
+  "src/json_compress.rs": {
+    "mtime": 1785939985.9639146,
+    "ast_hash": "d72eedcc10ab4ba19ecf1729e2a2350c",
+    "semantic_hash": "d72eedcc10ab4ba19ecf1729e2a2350c"
+  },
+  "src/lib.rs": {
+    "mtime": 1785983292.991649,
+    "ast_hash": "64157b25756f0671891b342d9494362b",
+    "semantic_hash": "64157b25756f0671891b342d9494362b"
+  },
+  "src/line_dedup.rs": {
+    "mtime": 1785934417.040034,
+    "ast_hash": "8230c7a4e2b8273d6f567c5f53c2c901",
+    "semantic_hash": "8230c7a4e2b8273d6f567c5f53c2c901"
+  },
+  "src/log_compress.rs": {
+    "mtime": 1785934566.805458,
+    "ast_hash": "e07668a46bbd6411990a30ad5462def2",
+    "semantic_hash": "e07668a46bbd6411990a30ad5462def2"
+  },
+  "src/main.rs": {
+    "mtime": 1785983308.9028077,
+    "ast_hash": "4c468a72fd0a51e0cf1ac17f39704542",
+    "semantic_hash": "4c468a72fd0a51e0cf1ac17f39704542"
+  },
+  "src/search_compress.rs": {
+    "mtime": 1785939985.9819148,
+    "ast_hash": "6d0cf5824145340253182e759c11a350",
+    "semantic_hash": "6d0cf5824145340253182e759c11a350"
+  },
+  "src/semantic_dedup.rs": {
+    "mtime": 1785980798.6996431,
+    "ast_hash": "8e5310f7a438dddf3e9458ffde72291a",
+    "semantic_hash": "8e5310f7a438dddf3e9458ffde72291a"
+  }
+}

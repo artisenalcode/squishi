@@ -1,0 +1,308 @@
+{
+  "communities": {
+    "0": [
+      "src_diff_compress",
+      "src_diff_compress_build_n_hunk_diff",
+      "src_diff_compress_build_synthetic_diff",
+      "src_diff_compress_combined_diff_3way_content_is_parsed_and_emitted",
+      "src_diff_compress_compress_diff",
+      "src_diff_compress_diff_combined_header_starts_a_file",
+      "src_diff_compress_diffcompressconfig",
+      "src_diff_compress_diffcompressconfig_default",
+      "src_diff_compress_diffcompressresult",
+      "src_diff_compress_difffile",
+      "src_diff_compress_difffile_total_changes",
+      "src_diff_compress_diffhunk",
+      "src_diff_compress_extract_line_number",
+      "src_diff_compress_format_output",
+      "src_diff_compress_is_diff_header",
+      "src_diff_compress_large_diff_compresses_meaningfully",
+      "src_diff_compress_max_files_cap_keeps_heaviest_files",
+      "src_diff_compress_max_hunks_per_file_cap_drops_excess",
+      "src_diff_compress_no_newline_marker_preserved_despite_distance",
+      "src_diff_compress_non_diff_input_passes_through",
+      "src_diff_compress_parse_diff",
+      "src_diff_compress_parseddiff",
+      "src_diff_compress_pre_diff_content_is_preserved",
+      "src_diff_compress_reduce_context",
+      "src_diff_compress_rename_markers_are_preserved_in_output",
+      "src_diff_compress_rs_default",
+      "src_diff_compress_rs_self",
+      "src_diff_compress_rs_string",
+      "src_diff_compress_rs_vec",
+      "src_diff_compress_score_hunks",
+      "src_diff_compress_select_hunks"
+    ],
+    "1": [
+      "src_content_detect",
+      "src_content_detect_classifies_html_via_magika",
+      "src_content_detect_classifies_rust_source_via_magika",
+      "src_content_detect_contentkind",
+      "src_content_detect_detect",
+      "src_content_detect_detects_git_diff_via_fast_regex",
+      "src_content_detect_detects_json_array",
+      "src_content_detect_detects_json_object",
+      "src_content_detect_detects_log_output",
+      "src_content_detect_detects_naked_hunk_without_git_header",
+      "src_content_detect_detects_search_results",
+      "src_content_detect_diff_containing_error_keywords_is_not_misrouted_to_log",
+      "src_content_detect_falls_back_to_plain_text_for_generic_prose",
+      "src_content_detect_magika_label",
+      "src_content_detect_malformed_json_like_content_falls_through",
+      "src_content_detect_rs_option",
+      "src_content_detect_rs_string",
+      "src_main",
+      "src_main_cli",
+      "src_main_main",
+      "src_main_output",
+      "src_main_rs_string"
+    ],
+    "2": [
+      "src_semantic_dedup",
+      "src_semantic_dedup_cosine_similarity",
+      "src_semantic_dedup_dedupresult",
+      "src_semantic_dedup_distinct_sentences_both_survive",
+      "src_semantic_dedup_identical_sentence_repeated_collapses_to_one",
+      "src_semantic_dedup_rs_result",
+      "src_semantic_dedup_rs_self",
+      "src_semantic_dedup_rs_session",
+      "src_semantic_dedup_rs_string",
+      "src_semantic_dedup_rs_vec",
+      "src_semantic_dedup_semanticdedup",
+      "src_semantic_dedup_semanticdedup_dedupe",
+      "src_semantic_dedup_semanticdedup_embed",
+      "src_semantic_dedup_semanticdedup_load",
+      "src_semantic_dedup_short_fragments_are_never_dropped",
+      "src_semantic_dedup_split_sentences",
+      "src_semantic_dedup_true_paraphrases_collapse",
+      "tokenizer"
+    ],
+    "3": [
+      "src_log_compress",
+      "src_log_compress_caps_repeated_errors_to_max_errors_plus_first_last",
+      "src_log_compress_classifiedline",
+      "src_log_compress_classify",
+      "src_log_compress_compress_log",
+      "src_log_compress_context_lines_surround_selected_errors",
+      "src_log_compress_keeps_all_lines_when_under_budget",
+      "src_log_compress_keeps_summary_lines_regardless_of_error_cap",
+      "src_log_compress_linelevel",
+      "src_log_compress_logcompressconfig",
+      "src_log_compress_logcompressconfig_default",
+      "src_log_compress_logcompressresult",
+      "src_log_compress_rs_default",
+      "src_log_compress_rs_self",
+      "src_log_compress_rs_string",
+      "src_log_compress_rs_vec",
+      "src_log_compress_select_first_last_and_top"
+    ],
+    "4": [
+      "src_json_compress",
+      "src_json_compress_compress_json_array",
+      "src_json_compress_dedupes_exact_duplicate_elements",
+      "src_json_compress_jsoncompressresult",
+      "src_json_compress_large_array_caps_to_first_and_last_edge",
+      "src_json_compress_non_array_json_returns_none",
+      "src_json_compress_non_json_returns_none",
+      "src_json_compress_rs_option",
+      "src_json_compress_rs_string",
+      "src_json_compress_small_array_is_unchanged_besides_formatting"
+    ],
+    "5": [
+      "src_line_dedup",
+      "src_line_dedup_dedupe_line_runs",
+      "src_line_dedup_dedupe_never_lossily_truncates_non_repeating_content",
+      "src_line_dedup_empty_content_stays_empty",
+      "src_line_dedup_rs_string",
+      "src_line_dedup_runs_of_five_identical_lines_are_not_collapsed",
+      "src_line_dedup_runs_over_five_identical_lines_are_collapsed",
+      "src_line_dedup_short_content_is_unchanged_besides_trailing_newline"
+    ],
+    "6": [
+      "src_search_compress",
+      "src_search_compress_caps_many_matches_in_one_file",
+      "src_search_compress_compress_search_results",
+      "src_search_compress_few_matches_per_file_are_kept_as_is",
+      "src_search_compress_preserves_per_file_grouping_across_interleaved_input",
+      "src_search_compress_rs_string",
+      "src_search_compress_searchcompressresult"
+    ],
+    "7": [
+      "examples_probe_magika",
+      "examples_probe_magika_classify",
+      "examples_probe_magika_main",
+      "examples_probe_magika_rs_result",
+      "examples_probe_magika_rs_session"
+    ],
+    "8": [
+      "examples_probe_optimized_cache",
+      "examples_probe_optimized_cache_main",
+      "examples_probe_optimized_cache_rs_box",
+      "examples_probe_optimized_cache_rs_error",
+      "examples_probe_optimized_cache_rs_result"
+    ],
+    "9": [
+      "examples_probe_single_load",
+      "examples_probe_single_load_main",
+      "examples_probe_single_load_rs_box",
+      "examples_probe_single_load_rs_error",
+      "examples_probe_single_load_rs_result"
+    ],
+    "10": [
+      "crate:squishi"
+    ],
+    "11": [
+      "src_lib"
+    ]
+  },
+  "cohesion": {
+    "0": 0.16559139784946236,
+    "1": 0.11688311688311688,
+    "2": 0.24183006535947713,
+    "3": 0.22794117647058823,
+    "4": 0.28888888888888886,
+    "5": 0.2857142857142857,
+    "6": 0.47619047619047616,
+    "7": 0.6,
+    "8": 0.4,
+    "9": 0.4,
+    "10": 1.0,
+    "11": 1.0
+  },
+  "gods": [
+    {
+      "id": "src_diff_compress_compress_diff",
+      "label": "compress_diff()",
+      "degree": 19
+    },
+    {
+      "id": "src_log_compress_compress_log",
+      "label": "compress_log()",
+      "degree": 10
+    },
+    {
+      "id": "src_diff_compress_difffile",
+      "label": "DiffFile",
+      "degree": 8
+    },
+    {
+      "id": "src_json_compress_compress_json_array",
+      "label": "compress_json_array()",
+      "degree": 7
+    },
+    {
+      "id": "src_main_main",
+      "label": "main()",
+      "degree": 7
+    },
+    {
+      "id": "src_diff_compress_diffhunk",
+      "label": "DiffHunk",
+      "degree": 6
+    },
+    {
+      "id": "src_search_compress_compress_search_results",
+      "label": "compress_search_results()",
+      "degree": 6
+    },
+    {
+      "id": "src_semantic_dedup_semanticdedup",
+      "label": "SemanticDedup",
+      "degree": 6
+    },
+    {
+      "id": "src_content_detect_detect",
+      "label": "detect()",
+      "degree": 5
+    },
+    {
+      "id": "src_diff_compress_parseddiff",
+      "label": "ParsedDiff",
+      "degree": 5
+    }
+  ],
+  "surprises": [
+    {
+      "source": "main()",
+      "target": "compress_diff()",
+      "source_files": [
+        "src/main.rs",
+        "src/diff_compress.rs"
+      ],
+      "confidence": "INFERRED",
+      "relation": "calls",
+      "why": "inferred connection - not explicitly stated in source; bridges separate communities"
+    },
+    {
+      "source": "main()",
+      "target": "compress_json_array()",
+      "source_files": [
+        "src/main.rs",
+        "src/json_compress.rs"
+      ],
+      "confidence": "INFERRED",
+      "relation": "calls",
+      "why": "inferred connection - not explicitly stated in source; bridges separate communities"
+    },
+    {
+      "source": "main()",
+      "target": "dedupe_line_runs()",
+      "source_files": [
+        "src/main.rs",
+        "src/line_dedup.rs"
+      ],
+      "confidence": "INFERRED",
+      "relation": "calls",
+      "why": "inferred connection - not explicitly stated in source; bridges separate communities"
+    },
+    {
+      "source": "main()",
+      "target": "compress_log()",
+      "source_files": [
+        "src/main.rs",
+        "src/log_compress.rs"
+      ],
+      "confidence": "INFERRED",
+      "relation": "calls",
+      "why": "inferred connection - not explicitly stated in source; bridges separate communities"
+    },
+    {
+      "source": "main()",
+      "target": "compress_search_results()",
+      "source_files": [
+        "src/main.rs",
+        "src/search_compress.rs"
+      ],
+      "confidence": "INFERRED",
+      "relation": "calls",
+      "why": "inferred connection - not explicitly stated in source; bridges separate communities"
+    }
+  ],
+  "questions": [
+    {
+      "type": "bridge_node",
+      "question": "Why does `main()` connect `Community 1` to `Community 0`, `Community 3`, `Community 4`, `Community 5`, `Community 6`?",
+      "why": "High betweenness centrality (0.277) - this node is a cross-community bridge."
+    },
+    {
+      "type": "bridge_node",
+      "question": "Why does `compress_diff()` connect `Community 0` to `Community 1`?",
+      "why": "High betweenness centrality (0.129) - this node is a cross-community bridge."
+    },
+    {
+      "type": "bridge_node",
+      "question": "Why does `compress_json_array()` connect `Community 4` to `Community 1`?",
+      "why": "High betweenness centrality (0.094) - this node is a cross-community bridge."
+    },
+    {
+      "type": "isolated_nodes",
+      "question": "What connects `squishi` to the rest of the system?",
+      "why": "1 weakly-connected nodes found - possible documentation gaps or missing edges."
+    },
+    {
+      "type": "low_cohesion",
+      "question": "Should `Community 1` be split into smaller, more focused modules?",
+      "why": "Cohesion score 0.11688311688311688 - nodes in this community are weakly interconnected."
+    }
+  ]
+}
