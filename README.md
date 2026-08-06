@@ -32,12 +32,18 @@ Detects content shape (`content_detect`) and routes:
   last + highest-scoring middle, capped) plus summary lines and context
   around each kept line. Emits `[N lines omitted: X error, Y warn]` for
   the rest.
+- **Plain prose** (`line_dedup` + `semantic_dedup`) — line-dedup first,
+  then, if the result is still over 2000 chars, sentence-level paraphrase
+  dedup (see below). Under the threshold, dedup alone is the whole pass —
+  no model load, stays fast.
 - **Everything else** (`line_dedup`) — collapses runs of >5 identical
   consecutive lines. Safe, lossless-in-spirit; never destroys
   non-repeating structure. Content that doesn't match Json/SearchResults/
-  Log gets a real sub-classification via `magika` (rust/html/diff/csv/
-  markdown/... — see below) rather than a blind "PlainText" label, even
-  though compression behavior is the same dedup-only pass for now.
+  Log/PlainText gets a real sub-classification via `magika` (rust/html/
+  diff/csv/markdown/... — see below) rather than a blind catch-all, even
+  though compression behavior is the same dedup-only pass for now (these
+  are structured formats, not prose — sentence-level paraphrase dedup
+  doesn't apply).
 
 `log_compress` and the router shape were arrived at by reading
 `headroom`'s ContentRouter/LogCompressor mechanism (classify → score →
@@ -64,44 +70,48 @@ the fallback path, never on content the regex checks already classified.
 Prints `{"compressed", "kind", "source", "chars_before", "chars_after",
 ...}` (extra fields vary by which compressor ran).
 
-## `kompress` — real, tested, not wired in
+## `semantic_dedup` — wired in, replaces the earlier Kompress port
 
-`src/kompress.rs` is a native Rust port of headroom's Kompress: a
-learned per-word keep/drop classifier (ModernBERT,
-`chopratejas/kompress-v2-base`, downloaded via `hf-hub` + run locally via
-`ort`/ONNX Runtime — the same stack `total-recall`'s embeddings already
-prove out, just applied to a different model). Correctness-verified
-against the real ONNX I/O contract (not assumed from headroom's Python
-source) and against real content: on genuinely filler-heavy prose it
-gets real, meaningful compression (412 words → 327, keeping content
-words, dropping "that"/"of"/"a"-type filler).
+Sentence-level paraphrase dedup: collapse the same idea restated in
+different words, not just exact-duplicate lines (`line_dedup`'s job).
+Same model and greedy single-pass clustering algorithm as
+`advisory/tools/dedupe_semantic.py` (`sentence-transformers/all-MiniLM-
+L6-v2`, STS-tuned), ported to raw Rust `ort` — not `fastembed`:
+`fastembed` hard-pins `ort =2.0.0-rc.13`, incompatible with `magika`'s
+hard pin on `=2.0.0-rc.12` in the same crate, and measured slower
+besides (~1.07s warm via `fastembed` vs ~587-708ms warm via raw `ort`
+for the same model). Downloaded via `hf-hub` + run locally via
+`ort`/ONNX Runtime, cached after first use — same stack `total-recall`'s
+embeddings already prove out, just the raw API instead of the wrapper.
 
-**Deliberately not wired into the default `compress` path.** Every
-invocation is a fresh process with no state to reuse, so every call pays
-the full ONNX session-load cost from scratch — measured at ~7.4s just to
-load, before any inference. That's fine for `line_dedup`/`log_compress`/
-etc. (all complete in milliseconds) but not worth triggering for
-`compress`'s default path, and not worth an unconditional model download
-baked into normal usage. A daemon architecture would amortize the load
-cost across calls; nothing here needs that yet. Revisit if/when a real
-use case shows up — the module, its tests (`#[ignore]`d by default, run
-explicitly with `cargo test -- --ignored`), and the verification probes
-(`examples/probe_kompress.rs`, `examples/probe_tokenizer.rs`,
-`examples/probe_scores.rs`) stay in the repo either way.
+Wired into the default `compress` path for `PlainText`: line-dedup
+runs first, and only if the result stays over 2000 chars does
+`semantic_dedup` load the model and run. Sentences are split, embedded,
+mean-pooled + L2-normalized (the standard sentence-transformers recipe —
+raw ONNX output is per-token `last_hidden_state`, not pre-pooled),
+then greedily deduped by cosine similarity (threshold 0.80, matching
+`dedupe_semantic.py`'s default). Sentences under 8 or over 40 words are
+never dropped — too short to be a meaningful whole-sentence paraphrase
+comparison. Measured on real paraphrase-heavy content: 21 sentences → 11,
+2035 chars → 1049 (~48% reduction), ~2.3s cold (includes first-run model
+download + load).
 
-Two real levers if this gets revisited, neither tried yet: `ort`'s
-`with_optimized_model_path` (serialize the post-optimization graph once,
-skip re-optimizing on every cold start) as a no-daemon fix, or a
-long-running process that loads the session once and serves requests
-over a local socket — the standard fix for "expensive load, cheap
-inference," but a real architecture change (squishi stops being a
-stateless one-shot CLI).
+Replaces the earlier native Kompress port (`src/kompress.rs`, removed):
+word-level keep/drop showed real compression only on genuinely
+filler-heavy prose and cost 4-18s per call with no state to reuse across
+invocations. This model is smaller (~90MB vs 261-601MB), faster
+(sub-second warm vs multi-second), and does a fundamentally more useful
+job for this content — comparing whole sentences to each other, not
+scoring words in isolation. Concluded not worth the cost for what it was
+trying to do; removed rather than kept dormant.
 
-`ort` is pinned to `=2.0.0-rc.12` (was `=2.0.0-rc.13`) — `magika` hard-
-pins `rc.12` even on its latest unreleased source, and `[patch]` can't
-bypass an exact pin from the same registry without forking. Confirmed
-API-compatible for everything squishi uses (`kompress.rs` needed zero
-changes), so this was the pragmatic fix over forking.
+If the model is unavailable (offline, first-run download fails), falls
+back to the line-dedup result rather than failing outright —
+`source: "dedup-semantic-unavailable"` in the JSON output signals this.
+
+`ort` is pinned to `=2.0.0-rc.12` — `magika` hard-pins `rc.12` even on
+its latest unreleased source, and `[patch]` can't bypass an exact pin
+from the same registry without forking.
 
 ## Remembered: the total-recall-kit ruleset (not built yet)
 
@@ -133,8 +143,8 @@ or `log_compress`.
 ## Development
 
 ```bash
-cargo test                    # fast — kompress's real-model tests are #[ignore]d
-cargo test -- --ignored       # slow — downloads/runs the real kompress model
+cargo test                    # fast — semantic_dedup's real-model tests are #[ignore]d
+cargo test -- --ignored       # slow — downloads/runs the real MiniLM model
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```

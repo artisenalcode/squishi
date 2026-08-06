@@ -4,15 +4,7 @@ use squishi::json_compress::compress_json_array;
 use squishi::line_dedup::dedupe_line_runs;
 use squishi::log_compress::{LogCompressConfig, compress_log};
 use squishi::search_compress::compress_search_results;
-
-// kompress (src/kompress.rs) is deliberately NOT wired in here. It's real,
-// tested, and correctness-verified (word-level keep/drop, matches
-// headroom's algorithm), but every invocation pays a ~7-18s ONNX
-// session-load cost with no state to reuse between one-shot CLI calls —
-// not worth triggering an unconditional model download for every
-// PlainText compress until there's an actual use case that justifies
-// that cost (a daemon architecture would amortize it; nothing here needs
-// that yet). Revisit if/when that use case shows up.
+use squishi::semantic_dedup::SemanticDedup;
 
 #[derive(Parser)]
 #[command(
@@ -25,6 +17,8 @@ struct Cli {
 }
 
 const SKIP_LOG_COMPRESS_UNDER_CHARS: usize = 2000;
+const SKIP_SEMANTIC_DEDUP_UNDER_CHARS: usize = 2000;
+const PARAPHRASE_THRESHOLD: f32 = 0.80; // matches dedupe_semantic.py's default
 
 struct Output {
     compressed: String,
@@ -85,10 +79,41 @@ fn main() {
                 }
             }
         }
+        ContentKind::PlainText => {
+            let deduped = dedupe_line_runs(&cli.text);
+            if deduped.len() <= SKIP_SEMANTIC_DEDUP_UNDER_CHARS {
+                Output {
+                    compressed: deduped,
+                    source: "dedup",
+                    detail: String::new(),
+                }
+            } else {
+                match SemanticDedup::load()
+                    .and_then(|mut d| d.dedupe(&deduped, PARAPHRASE_THRESHOLD))
+                {
+                    Ok(result) => Output {
+                        detail: format!(
+                            "\"sentences_before\":{},\"sentences_after\":{}",
+                            result.original_sentences, result.kept_sentences
+                        ),
+                        compressed: result.content,
+                        source: "dedup+semantic",
+                    },
+                    // Model unavailable (offline, first-run download
+                    // failed) — line-dedup's result is still real
+                    // compression, use it rather than failing outright.
+                    Err(e) => Output {
+                        compressed: deduped,
+                        source: "dedup-semantic-unavailable",
+                        detail: format!("\"semantic_error\":{e:?}"),
+                    },
+                }
+            }
+        }
         // Other(_) carries Magika's real classification (rust/html/diff/
-        // csv/markdown/...) for observability — no dedicated compressor
-        // per label yet, so behavior matches PlainText for now.
-        ContentKind::PlainText | ContentKind::Other(_) => Output {
+        // csv/markdown/...) — structured formats, not prose, so sentence-
+        // level paraphrase dedup doesn't apply; line_dedup only.
+        ContentKind::Other(_) => Output {
             compressed: dedupe_line_runs(&cli.text),
             source: "dedup",
             detail: String::new(),
