@@ -1713,7 +1713,6 @@ dependencies = [
  "magika",
  "ort",
  "regex",
- "serde",
  "serde_json",
  "tempfile",
  "tokenizers",

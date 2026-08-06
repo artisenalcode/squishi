@@ -1,13 +1,17 @@
 //! Black-box tests against the actual compiled binary — the real
-//! deployable artifact governator's `squishi.rs` wrapper shells out to.
-//! Unit tests in `src/main.rs::route` cover the routing logic; these
-//! cover the thing an actual consumer depends on: argv in, stdout out,
-//! and that stdout is valid, parseable JSON with the expected shape.
+//! deployable artifact governator's `squishi.rs` wrapper shells out to,
+//! and the same binary a harness skill invokes. Unit tests in
+//! `src/main.rs::route` cover the routing logic; these cover the thing
+//! an actual consumer depends on: argv/stdin in, stdout out, in both
+//! output modes.
 
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
-fn run(text: &str) -> serde_json::Value {
+/// Runs with `--json`, for the governator-contract tests below.
+fn run_json(text: &str) -> serde_json::Value {
     let output = Command::new(env!("CARGO_BIN_EXE_squishi"))
+        .arg("--json")
         .arg(text)
         .output()
         .expect("failed to run squishi binary");
@@ -21,6 +25,10 @@ fn run(text: &str) -> serde_json::Value {
     let stdout = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("stdout was not valid JSON ({e}): {stdout:?}"))
+}
+
+fn run(text: &str) -> serde_json::Value {
+    run_json(text)
 }
 
 #[test]
@@ -71,4 +79,72 @@ fn rust_source_is_classified_as_other() {
         kind.starts_with("Other("),
         "expected Other(_) classification, got {kind}"
     );
+}
+
+#[test]
+fn default_output_is_bare_compressed_text_not_json() {
+    // The harness-facing default: no --json, positional arg. stdout
+    // should be exactly the compressed text, nothing else — not a JSON
+    // object a caller has to parse just to get the content back out.
+    let output = Command::new(env!("CARGO_BIN_EXE_squishi"))
+        .arg("just a short paragraph of prose with no special structure.")
+        .output()
+        .expect("failed to run squishi binary");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        serde_json::from_str::<serde_json::Value>(stdout.trim()).is_err(),
+        "default output should not be JSON, got: {stdout:?}"
+    );
+    assert!(stdout.contains("just a short paragraph of prose"));
+}
+
+#[test]
+fn reads_from_stdin_when_no_argument_given() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_squishi"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn squishi binary");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"content piped in over stdin, no positional argument at all")
+        .expect("failed to write to stdin");
+
+    let output = child.wait_with_output().expect("failed to wait on child");
+    assert!(
+        output.status.success(),
+        "squishi exited non-zero: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("content piped in over stdin"));
+}
+
+#[test]
+fn json_flag_still_works_when_content_comes_from_stdin() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_squishi"))
+        .arg("--json")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn squishi binary");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"[{"a":1},{"a":1}]"#)
+        .expect("failed to write to stdin");
+
+    let output = child.wait_with_output().expect("failed to wait on child");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout should be valid JSON");
+    assert_eq!(value["kind"], "Json");
 }

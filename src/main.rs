@@ -1,5 +1,4 @@
 use clap::Parser;
-use serde::Serialize;
 use serde_json::{Map, Value};
 use squishi::content_detect::{ContentKind, detect};
 use squishi::diff_compress::{DiffCompressConfig, compress_diff};
@@ -15,8 +14,19 @@ use squishi::semantic_dedup::SemanticDedup;
     about = "Rust-native text compressor — detects content shape, routes to the right technique. No store, no retrieve, that's total-recall's job"
 )]
 struct Cli {
-    /// Text to compress.
-    text: String,
+    /// Text to compress. Omit to read from stdin instead — the harness-
+    /// agnostic path: no shell-argument size limit, no quoting/escaping
+    /// fragility on large multi-line content (a big diff, log, or file
+    /// read), unlike passing content as a positional argument.
+    text: Option<String>,
+
+    /// Emit the full JSON contract (compressed/kind/source/chars_before/
+    /// chars_after/...) instead of the default bare compressed text.
+    /// governator and other programmatic consumers want this; a harness
+    /// piping content through for its own use generally just wants the
+    /// compressed text back.
+    #[arg(long)]
+    json: bool,
 }
 
 const SKIP_LOG_COMPRESS_UNDER_CHARS: usize = 2000;
@@ -184,40 +194,68 @@ fn route(text: &str) -> (ContentKind, Output) {
     (kind, output)
 }
 
-/// The CLI's full JSON output contract — governator's `squishi.rs` wrapper
-/// depends on exactly these top-level fields (plus whatever `detail`
-/// flattens in). One typed, serializable shape instead of hand-built
-/// `Map`/`Value` construction duplicated between `main` and its tests.
-#[derive(Serialize)]
-struct CliOutput {
-    compressed: String,
-    kind: String,
-    source: &'static str,
-    chars_before: usize,
-    chars_after: usize,
-    #[serde(flatten)]
-    detail: Map<String, Value>,
+/// Builds the CLI's full JSON output contract — governator's
+/// `squishi.rs` wrapper depends on exactly these top-level fields (plus
+/// whatever `detail` flattens in). A plain `Map<String, Value>`, not a
+/// `#[derive(Serialize)]` struct: real `Value` types (not string
+/// formatting) already give correct escaping on their own — a derive
+/// macro buys nothing here beyond what this one shared function already
+/// gets by existing, and it's not worth a proc-macro dependency for a
+/// secondary, opt-in output path (`--json`; the default is bare text).
+fn build_output(text: &str, kind: &ContentKind, output: Output) -> Map<String, Value> {
+    let chars_after = output.compressed.len();
+    let mut json = Map::new();
+    json.insert("compressed".to_string(), Value::from(output.compressed));
+    json.insert("kind".to_string(), Value::from(format!("{kind:?}")));
+    json.insert("source".to_string(), Value::from(output.source));
+    json.insert("chars_before".to_string(), Value::from(text.len()));
+    json.insert("chars_after".to_string(), Value::from(chars_after));
+    json.extend(output.detail);
+    json
 }
 
-fn build_output(text: &str, kind: &ContentKind, output: Output) -> CliOutput {
-    CliOutput {
-        chars_before: text.len(),
-        chars_after: output.compressed.len(),
-        compressed: output.compressed,
-        kind: format!("{kind:?}"),
-        source: output.source,
-        detail: output.detail,
+/// Resolve the content to compress: the positional argument if given,
+/// otherwise stdin. Refuses to block reading from an interactive
+/// terminal with neither — that's almost always a forgotten argument,
+/// not someone about to type input, and hanging silently is the worst
+/// failure mode for a tool meant to sit in an automated pipeline.
+fn read_input(cli: &Cli) -> Result<String, String> {
+    if let Some(text) = &cli.text {
+        return Ok(text.clone());
     }
+
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Err(
+            "no text argument given and stdin is a terminal (not a pipe) — \
+             pass text as an argument or pipe content in, e.g. `cat file | squishi`"
+                .to_string(),
+        );
+    }
+
+    let mut buf = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+        .map_err(|e| format!("failed to read stdin: {e}"))?;
+    Ok(buf)
 }
 
 fn main() {
     let cli = Cli::parse();
-    let (kind, output) = route(&cli.text);
-    let cli_output = build_output(&cli.text, &kind, output);
-    println!(
-        "{}",
-        serde_json::to_string(&cli_output).expect("CliOutput is always serializable")
-    );
+    let text = match read_input(&cli) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    let (kind, output) = route(&text);
+    let json = build_output(&text, &kind, output);
+
+    if cli.json {
+        println!("{}", Value::Object(json));
+    } else {
+        println!("{}", json["compressed"].as_str().unwrap_or_default());
+    }
 }
 
 #[cfg(test)]
