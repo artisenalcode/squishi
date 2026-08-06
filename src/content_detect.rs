@@ -22,6 +22,7 @@ pub enum ContentKind {
     Json,
     SearchResults,
     Log,
+    Diff,
     PlainText,
     /// Magika's raw label for content that isn't Json/SearchResults/Log
     /// and isn't generic prose either (e.g. "rust", "html", "diff",
@@ -35,6 +36,15 @@ pub enum ContentKind {
 static SEARCH_RESULT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\S+:\d+:").unwrap());
 static LOG_LEVEL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(error|warn(ing)?|fatal|fail(ed)?)\b").unwrap());
+/// `diff --git`/`--combined`/`--cc` headers, or a naked `--- a/`/`--- /dev/null`
+/// hunk-file marker (unified diff without the git wrapper, e.g. `diff -u`
+/// output). Checked before Log: diff hunks routinely contain words like
+/// "fail"/"error" in test code, which would otherwise misroute them.
+static DIFF_HEADER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^diff --(git a/|combined |cc )").unwrap());
+static NAKED_HUNK_OLD_FILE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^--- (a/.+|/dev/null)$").unwrap());
+static HUNK_MARKER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^@@ -\d").unwrap());
 
 /// Magika's label for generic, structureless text — mapped to
 /// ContentKind::PlainText rather than Other("txt"), since that's exactly
@@ -58,6 +68,13 @@ pub fn detect(content: &str) -> ContentKind {
             .count();
         if search_lines * 2 >= lines.len() {
             return ContentKind::SearchResults;
+        }
+
+        let has_diff_header = lines.iter().any(|l| DIFF_HEADER_RE.is_match(l));
+        let has_naked_hunk = lines.iter().any(|l| NAKED_HUNK_OLD_FILE_RE.is_match(l))
+            && lines.iter().any(|l| HUNK_MARKER_RE.is_match(l));
+        if has_diff_header || has_naked_hunk {
+            return ContentKind::Diff;
         }
 
         let log_lines = lines.iter().filter(|l| LOG_LEVEL_RE.is_match(l)).count();
@@ -139,8 +156,25 @@ mod tests {
     }
 
     #[test]
-    fn classifies_diff_via_magika() {
+    fn detects_git_diff_via_fast_regex() {
+        // The fast regex tier now catches this before it ever reaches
+        // Magika — diffs are a stronger, cheaper-to-check signal than a
+        // probabilistic classifier, same reasoning as Json/SearchResults/
+        // Log above.
         let content = "diff --git a/src/main.rs b/src/main.rs\nindex abc..def 100644\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,3 +1,3 @@\n-let x = 5;\n+let x = 10;\n";
-        assert_eq!(detect(content), ContentKind::Other("diff".to_string()));
+        assert_eq!(detect(content), ContentKind::Diff);
+    }
+
+    #[test]
+    fn detects_naked_hunk_without_git_header() {
+        let content =
+            "--- a/foo.py\n+++ b/foo.py\n@@ -1,2 +1,2 @@\n-old line\n+new line\n context\n";
+        assert_eq!(detect(content), ContentKind::Diff);
+    }
+
+    #[test]
+    fn diff_containing_error_keywords_is_not_misrouted_to_log() {
+        let content = "diff --git a/test.py b/test.py\n--- a/test.py\n+++ b/test.py\n@@ -1,2 +1,2 @@\n-def test_fail():\n+def test_error_handling():\n";
+        assert_eq!(detect(content), ContentKind::Diff);
     }
 }

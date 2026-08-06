@@ -1,5 +1,6 @@
 use clap::Parser;
 use squishi::content_detect::{ContentKind, detect};
+use squishi::diff_compress::{DiffCompressConfig, compress_diff};
 use squishi::json_compress::compress_json_array;
 use squishi::line_dedup::dedupe_line_runs;
 use squishi::log_compress::{LogCompressConfig, compress_log};
@@ -17,6 +18,7 @@ struct Cli {
 }
 
 const SKIP_LOG_COMPRESS_UNDER_CHARS: usize = 2000;
+const SKIP_DIFF_COMPRESS_UNDER_CHARS: usize = 2000;
 const SKIP_SEMANTIC_DEDUP_UNDER_CHARS: usize = 2000;
 const PARAPHRASE_THRESHOLD: f32 = 0.80; // matches dedupe_semantic.py's default
 
@@ -76,6 +78,25 @@ fn main() {
                     ),
                     compressed: result.content,
                     source: "dedup+log",
+                }
+            }
+        }
+        ContentKind::Diff => {
+            if cli.text.len() <= SKIP_DIFF_COMPRESS_UNDER_CHARS {
+                Output {
+                    compressed: cli.text.clone(),
+                    source: "passthrough",
+                    detail: String::new(),
+                }
+            } else {
+                let result = compress_diff(&cli.text, "", &DiffCompressConfig::default());
+                Output {
+                    detail: format!(
+                        "\"files_affected\":{},\"hunks_removed\":{}",
+                        result.files_affected, result.hunks_removed
+                    ),
+                    compressed: result.content,
+                    source: "diff",
                 }
             }
         }

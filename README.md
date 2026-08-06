@@ -32,6 +32,11 @@ Detects content shape (`content_detect`) and routes:
   last + highest-scoring middle, capped) plus summary lines and context
   around each kept line. Emits `[N lines omitted: X error, Y warn]` for
   the rest.
+- **Git diffs / unified diffs** (`diff_compress`) — caps file count
+  (keeps the heaviest by change volume), caps hunks/file (first + last +
+  top-scored middle — scored by change density, priority keywords, and
+  query-context word overlap), trims context lines around each `+`/`-`.
+  See below for the port rationale and real measurements.
 - **Plain prose** (`line_dedup` + `semantic_dedup`) — line-dedup first,
   then, if the result is still over 2000 chars, sentence-level paraphrase
   dedup (see below). Under the threshold, dedup alone is the whole pass —
@@ -67,8 +72,57 @@ Cost: ~111ms to load the model (`google/magika`'s official Rust crate —
 Kompress's on-demand download) plus ~28ms/classification — only paid on
 the fallback path, never on content the regex checks already classified.
 
+Diff detection is also a fast regex tier, checked before Log: a
+`diff --git`/`--combined`/`--cc` header, or a naked `--- a/`/`--- /dev/null`
+file marker paired with an `@@` hunk header (unified diff without the git
+wrapper). Has to run before the Log check — diff hunks routinely contain
+words like `fail`/`error` in test code, which would otherwise misroute
+them.
+
 Prints `{"compressed", "kind", "source", "chars_before", "chars_after",
 ...}` (extra fields vary by which compressor ran).
+
+## `diff_compress` — real port of headroom's `DiffCompressor`, CCR stripped
+
+Unlike `log_compress`/`json_compress`/`search_compress` (own design,
+same shape as headroom's mechanism), this one is a much closer port of
+`crates/headroom-core/src/transforms/diff_compressor.rs`: the parser,
+hunk-relevance scorer (change density + priority-keyword regex +
+query-context word overlap), first+last+top-scored-middle hunk
+selection, and context-line trimming are all carried over near-verbatim
+— that logic isn't headroom-proxy-specific, it's just correct diff
+handling. What's stripped entirely: the CCR cache-key/retrieval-marker
+machinery (MD5 hash, `[N lines compressed to M. Retrieve: hash=...]`
+marker, `CcrStore` persistence) and the `DiffCompressorStats`
+observability sidecar (tracing spans, per-file drop stats) — squishi has
+no store (total-recall's job) and no daemon to keep counters in.
+
+Config defaults are headroom's own (`max_files: 20`, `max_hunks_per_file:
+10`, `max_context_lines: 2`) — kept as-is after real measurement, not
+re-tuned on a guess. Tested against real headroom commits, not just
+synthetic fixtures:
+
+- A typical PR-sized diff (20 files, ≤9 hunks in any single file — under
+  both caps): 84,448 → 78,515 chars, **7.0% reduction**, `hunks_removed:
+  0`. All the savings came from trimming git's default 3-line context
+  down to 2 — neither structural cap fires on an ordinary diff, since
+  headroom's thresholds were tuned for an LLM-proxy's worst-case
+  traffic, not typical code-review-sized diffs.
+- An oversized diff (24 files, one file with >10 hunks): 100,898 →
+  84,748 chars, **16.0% reduction** — file cap dropped 4 files, hunk cap
+  dropped 9 hunks. Output verified intact: commit header, rename/mode
+  markers, hunk structure, summary footer all correct.
+- Cost is pure CPU (regex + string ops, no ML, no subprocess): ~27-34ms
+  cold (includes one-time regex compilation) for the largest diff
+  tested (100KB/24 files), ~6-7ms warm steady-state. Three orders of
+  magnitude cheaper than `semantic_dedup`'s ONNX pass — unlike Kompress,
+  there was never a real cost-vs-benefit tension here to resolve.
+- Conclusion: defaults are fine to ship as-is. The savings ceiling on
+  everyday diffs is modest by design (headroom's caps rarely engage
+  below outlier-sized changesets) — retune `max_hunks_per_file`/
+  `max_files`/`max_context_lines` later against real governator traffic
+  if that turns out to matter, not against a guess made before any
+  traffic exists.
 
 ## `semantic_dedup` — wired in, replaces the earlier Kompress port
 
