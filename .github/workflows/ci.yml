@@ -15,8 +15,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt, clippy, llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      # Reported only, not gated — a starting coverage baseline, not a
+      # merge blocker. cargo-llvm-cov re-runs the test binaries under
+      # instrumentation; --ignore-filename-regex keeps generated/vendored
+      # code out of the number.
+      - run: cargo llvm-cov --summary-only
