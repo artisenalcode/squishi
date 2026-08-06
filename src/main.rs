@@ -3,6 +3,7 @@ use serde_json::{Map, Value};
 use squishi::base64_strip::strip_base64_blobs;
 use squishi::content_detect::{ContentKind, detect};
 use squishi::diff_compress::{DiffCompressConfig, compress_diff};
+use squishi::doctor;
 use squishi::json_compress::compress_json_array;
 use squishi::line_dedup::dedupe_line_runs;
 use squishi::log_compress::{LogCompressConfig, compress_log};
@@ -28,6 +29,18 @@ struct Cli {
     /// compressed text back.
     #[arg(long)]
     json: bool,
+
+    /// Run self-diagnostics instead of compressing `text` (ignored when
+    /// set). Not a subcommand: squishi's Cli has no Commands enum, and
+    /// `squishi doctor` would be ambiguous with compressing the literal
+    /// string "doctor" — a flag has no such collision.
+    #[arg(long)]
+    doctor: bool,
+
+    /// With --doctor, skip the two expensive model-load checks (magika,
+    /// semantic-dedup). Ignored without --doctor.
+    #[arg(long)]
+    quick: bool,
 }
 
 const SKIP_LOG_COMPRESS_UNDER_CHARS: usize = 2000;
@@ -257,6 +270,25 @@ fn read_input(cli: &Cli) -> Result<String, String> {
 
 fn main() {
     let cli = Cli::parse();
+
+    if cli.doctor {
+        let report = doctor::run(cli.quick);
+        if cli.json {
+            println!("{}", report.to_json());
+        } else {
+            for check in &report.checks {
+                let label = match check.status {
+                    doctor::Status::Pass => "PASS",
+                    doctor::Status::Warn => "WARN",
+                    doctor::Status::Fail => "FAIL",
+                    doctor::Status::Skipped => "SKIP",
+                };
+                println!("{label}  {}: {}", check.name, check.message);
+            }
+        }
+        std::process::exit(if report.has_failures() { 1 } else { 0 });
+    }
+
     let text = match read_input(&cli) {
         Ok(text) => text,
         Err(e) => {

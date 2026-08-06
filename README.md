@@ -186,6 +186,38 @@ back to the line-dedup result rather than failing outright —
 its latest unreleased source, and `[patch]` can't bypass an exact pin
 from the same registry without forking.
 
+## `--doctor` — self-diagnostics
+
+`squishi --doctor` checks this tool's own real failure surface instead of
+compressing anything: binary identity (which build is actually running,
+via `current_exe()` + crate version), whether magika loads, where the
+semantic-dedup model cache (`hf_hub::Api::new()`) actually resolves to and
+whether the model files are already cached there, whether semantic-dedup
+itself loads, and a best-effort proxy signal for the PostToolUse hook
+(file presence + `last-input.json`'s mtime — explicitly *not* a
+registration check; there's no reliable programmatic way to confirm a
+plugin-registered hook is live, see `anthropics/claude-code#84439`).
+
+```
+squishi --doctor          # full run, real model loads
+squishi --doctor --quick  # skips magika/semantic-dedup loads
+squishi --doctor --json   # structured output, same --json flag as compress
+```
+
+Exit code 1 if any check fails, 0 otherwise (warnings are fine). Not a
+subcommand — `squishi doctor` would collide with compressing the literal
+string `"doctor"` — so it's a flag, ignoring `text` when set. No `--fix`:
+unlike `total-recall`'s own `doctor` (same `Check`/`Status` shape,
+separate implementation — no shared crate yet, only two real
+implementations exist), squishi has no repairable persistent state: no
+locks, no bank dirs, nothing that gets stuck.
+
+Real finding surfaced by this check, not assumed: `hf_hub::Api::new()`
+(what `semantic_dedup::SemanticDedup::load` actually calls) resolves via
+`Cache::default()`, which always uses `~/.cache/huggingface/hub` —
+`HF_HOME` is silently ignored by that call path. `--doctor` reports this
+explicitly when `HF_HOME` is set but wouldn't take effect.
+
 ## Remembered: the total-recall-kit ruleset (not built yet)
 
 `total-recall-kit` (deleted from `_labs`, evaluated for value first) had a

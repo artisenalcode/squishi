@@ -1709,6 +1709,7 @@ name = "squishi"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "dirs",
  "hf-hub",
  "magika",
  "ort",
