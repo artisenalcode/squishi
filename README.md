@@ -267,6 +267,35 @@ output back into a live session automatically.
 
 Not a subcommand — same "flag not subcommand" reasoning as `--doctor`.
 
+## `session_digest` — extraction + compression for total-recall staging
+
+Rust port of `mindforge/tools/session_to_trm.py` (Python, being retired)
+plus the extraction half of `extract_claude_sessions.py`. Pulls
+human/assistant prose out of a Claude Code session transcript (drops
+`tool_use`/`tool_result` blocks entirely, strips trailing
+`<system-reminder>` injections), compresses it through squishi's normal
+`route()` path, and builds a ready-to-stage digest with a metadata
+header (`session_id`, `cwd`, `first_ts`, `last_ts`, `turn_count`).
+
+```
+squishi --session-digest <transcript.jsonl>          # digest text on stdout
+squishi --session-digest <transcript.jsonl> --json   # + session_id/cwd/turn_count/... for a caller
+squishi --session-digest <transcript.jsonl> --max-chars 50000
+```
+
+**Deliberately not layered on `session_prune`.** Real finding, checked
+before assuming they'd compose: `session_prune` only touches
+`tool_result` content; `extract_session_text` discards all
+`tool_use`/`tool_result` blocks unconditionally, regardless of pruning.
+They operate on disjoint fields of the same transcript — running one
+before the other has no effect on the output.
+
+**Boundary held**: this is extraction and compression only. squishi
+never calls `trm` or anything storage-shaped — `total-recall`'s own
+`trm ingest-session <path>` is the caller that runs this and stages the
+result, keeping the actual `stage` call in the tool that already owns
+storage.
+
 ## Development
 
 ```bash

@@ -7,4 +7,5 @@ pub mod line_dedup;
 pub mod log_compress;
 pub mod search_compress;
 pub mod semantic_dedup;
+pub mod session_digest;
 pub mod session_prune;

@@ -9,6 +9,7 @@ use squishi::line_dedup::dedupe_line_runs;
 use squishi::log_compress::{LogCompressConfig, compress_log};
 use squishi::search_compress::compress_search_results;
 use squishi::semantic_dedup::SemanticDedup;
+use squishi::session_digest;
 use squishi::session_prune;
 
 #[derive(Parser)]
@@ -71,6 +72,20 @@ struct Cli {
     /// input transcript.
     #[arg(long, value_name = "OUT_PATH")]
     write: Option<std::path::PathBuf>,
+
+    /// Extract human/assistant prose from a Claude Code session
+    /// transcript (JSONL), compress it, and build a ready-to-stage
+    /// digest — instead of compressing `text` (ignored when set). Same
+    /// "flag not subcommand" reasoning as --doctor. Extraction and
+    /// compression only; squishi never calls total-recall itself
+    /// (`trm ingest-session` is the caller that stages the result).
+    #[arg(long, value_name = "TRANSCRIPT_PATH")]
+    session_digest: Option<std::path::PathBuf>,
+
+    /// With --session-digest, the extracted-text truncation cap (middle
+    /// dropped, head+tail kept), matching session_to_trm.py's default.
+    #[arg(long, default_value_t = 100_000)]
+    max_chars: usize,
 }
 
 const SKIP_LOG_COMPRESS_UNDER_CHARS: usize = 2000;
@@ -370,6 +385,56 @@ fn main() {
                 "total: {} candidates, {total_bytes} bytes prunable",
                 candidates.len()
             );
+        }
+        return;
+    }
+
+    if let Some(path) = &cli.session_digest {
+        let jsonl = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: failed to read {}: {e}", path.display());
+                std::process::exit(2);
+            }
+        };
+        let (extracted, meta) = session_digest::extract_session_text(&jsonl, cli.max_chars);
+        if extracted.trim().is_empty() {
+            eprintln!("nothing to digest (empty session)");
+            std::process::exit(1);
+        }
+        let chars_before = extracted.len();
+        let (_, compress_output) = route(&extracted);
+        let compressed = compress_output.compressed;
+        let chars_after = compressed.len();
+        let content = session_digest::build_digest_content(&compressed, &meta);
+
+        if cli.json {
+            let mut json = Map::new();
+            json.insert("content".to_string(), Value::from(content));
+            json.insert(
+                "session_id".to_string(),
+                meta.session_id.map(Value::from).unwrap_or(Value::Null),
+            );
+            json.insert(
+                "cwd".to_string(),
+                meta.cwd.map(Value::from).unwrap_or(Value::Null),
+            );
+            json.insert(
+                "first_ts".to_string(),
+                meta.first_ts.map(Value::from).unwrap_or(Value::Null),
+            );
+            json.insert(
+                "last_ts".to_string(),
+                meta.last_ts.map(Value::from).unwrap_or(Value::Null),
+            );
+            json.insert("turn_count".to_string(), Value::from(meta.turn_count));
+            json.insert("truncated".to_string(), Value::from(meta.truncated));
+            json.insert("raw_bytes".to_string(), Value::from(meta.raw_bytes));
+            json.insert("chars_before".to_string(), Value::from(chars_before));
+            json.insert("chars_after".to_string(), Value::from(chars_after));
+            println!("{}", Value::Object(json));
+        } else {
+            println!("{content}");
         }
         return;
     }
