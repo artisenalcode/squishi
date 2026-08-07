@@ -281,6 +281,10 @@ fn route_with_override(text: &str, forced_kind: Option<ContentKind>) -> (Content
                                 ("summary".to_string(), Value::from(result.summary)),
                                 ("stories".to_string(), Value::from(stories)),
                                 ("drops".to_string(), Value::from(traceability)),
+                                (
+                                    "punctuation_restored".to_string(),
+                                    Value::from(result.punctuation_restored),
+                                ),
                             ]),
                             compressed: result.content,
                             source: "dedup+semantic",

@@ -121,10 +121,12 @@ fn split_by_word_window(content: &str, window: usize) -> Vec<&str> {
         .collect()
 }
 
-/// Sentence-shaped units for dedup: real sentence splitting when the
-/// text has real punctuation, a fixed-size word-window fallback when it
-/// doesn't (see `is_effectively_unpunctuated` — this is the common case
-/// for raw YouTube auto-captions, not a rare exception).
+/// Sentence-shaped units for dedup, given text that's already had a
+/// chance at punctuation restoration (see `SemanticDedup::dedupe` —
+/// this is the fallback tier, not the primary path anymore): real
+/// sentence splitting when the text has real punctuation, a fixed-size
+/// word-window split when it still doesn't (restoration unavailable or
+/// failed).
 fn split_sentences(content: &str) -> Vec<&str> {
     if is_effectively_unpunctuated(content) {
         split_by_word_window(content, FALLBACK_WINDOW_WORDS)
@@ -136,6 +138,11 @@ fn split_sentences(content: &str) -> Vec<&str> {
 pub struct SemanticDedup {
     session: Session,
     tokenizer: Tokenizer,
+    /// Lazily loaded on first unpunctuated input — most callers never
+    /// hit unpunctuated text in a given call, so the ~562MB punctuation
+    /// model shouldn't be paid for unconditionally on every `dedupe()`.
+    punctuation_restorer: Option<crate::punctuation_restore::PunctuationRestorer>,
+    punctuation_load_attempted: bool,
 }
 
 /// Deterministic, regex-based — same heuristic style as
@@ -205,6 +212,12 @@ pub struct DedupResult {
     /// always-kept fragments aren't meaningfully rankable in isolation
     /// and are never central to anything by construction.
     pub summary: Vec<String>,
+    /// Whether real punctuation restoration ran and produced the
+    /// sentence units this result is based on, vs. the word-window
+    /// fallback (restoration unavailable, or input already had real
+    /// punctuation and never needed it). A real quality signal for the
+    /// caller — word-window-derived sentences are choppier.
+    pub punctuation_restored: bool,
 }
 
 impl SemanticDedup {
@@ -222,7 +235,12 @@ impl SemanticDedup {
 
         let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| e.to_string())?;
 
-        Ok(Self { session, tokenizer })
+        Ok(Self {
+            session,
+            tokenizer,
+            punctuation_restorer: None,
+            punctuation_load_attempted: false,
+        })
     }
 
     /// Splits `content` into sentences, greedily drops any sentence whose
@@ -231,7 +249,28 @@ impl SemanticDedup {
     /// MIN_WORDS..MAX_WORDS are never dropped (not meaningfully
     /// comparable as whole-sentence paraphrases) — always kept as-is.
     pub fn dedupe(&mut self, content: &str, threshold: f32) -> Result<DedupResult, String> {
-        let sentences: Vec<&str> = split_sentences(content.trim());
+        let content = content.trim();
+
+        // Try real punctuation restoration first when the input needs
+        // it — `restored` has to be declared here (not inside the `if`)
+        // so `text_for_split`'s borrow can outlive the branch.
+        let restored;
+        let (text_for_split, punctuation_restored) = if is_effectively_unpunctuated(content) {
+            match self
+                .punctuation_restorer()
+                .and_then(|r| r.restore(content).ok())
+            {
+                Some(r) => {
+                    restored = r;
+                    (restored.as_str(), true)
+                }
+                None => (content, false),
+            }
+        } else {
+            (content, false)
+        };
+
+        let sentences: Vec<&str> = split_sentences(text_for_split);
         let original_sentences = sentences.len();
 
         let mut kept: Vec<KeptSentence> = Vec::new();
@@ -290,7 +329,24 @@ impl SemanticDedup {
             kept,
             drops,
             summary,
+            punctuation_restored,
         })
+    }
+
+    /// Lazily loads the punctuation-restoration model on first need —
+    /// most `dedupe()` calls never hit unpunctuated input, so its
+    /// ~562MB shouldn't be paid unconditionally. Cached on `self` for
+    /// the rest of this `SemanticDedup`'s lifetime once attempted
+    /// (success or failure) — never retries a failed load mid-call.
+    fn punctuation_restorer(
+        &mut self,
+    ) -> Option<&mut crate::punctuation_restore::PunctuationRestorer> {
+        if !self.punctuation_load_attempted {
+            self.punctuation_load_attempted = true;
+            self.punctuation_restorer =
+                crate::punctuation_restore::PunctuationRestorer::load().ok();
+        }
+        self.punctuation_restorer.as_mut()
     }
 
     fn embed(&mut self, text: &str) -> Result<Vec<f32>, String> {
