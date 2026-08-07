@@ -8,7 +8,7 @@ use squishi::json_compress::compress_json_array;
 use squishi::line_dedup::dedupe_line_runs;
 use squishi::log_compress::{LogCompressConfig, compress_log};
 use squishi::search_compress::compress_search_results;
-use squishi::semantic_dedup::SemanticDedup;
+use squishi::semantic_dedup::{SemanticDedup, SentenceShape};
 use squishi::session_digest;
 use squishi::session_prune;
 
@@ -86,6 +86,24 @@ struct Cli {
     /// dropped, head+tail kept), matching session_to_trm.py's default.
     #[arg(long, default_value_t = 100_000)]
     max_chars: usize,
+
+    /// Skip shape detection and force this content kind — for a caller
+    /// that already knows structurally what it's staging (e.g. total-
+    /// recall's persona ingestion knows a cleaned YouTube-caption
+    /// transcript is conversational prose) rather than trusting
+    /// `detect()`'s heuristics, which can misfire on prose containing
+    /// ordinary words like "failed" (see `content_detect.rs`'s
+    /// LOG_LEVEL_RE — no structural check, matches on the word alone).
+    /// Only `plain-text` is wired today; other kinds don't need forcing
+    /// since detect() already identifies them reliably.
+    #[arg(long, value_enum)]
+    force_kind: Option<ForceKind>,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy)]
+#[value(rename_all = "kebab-case")]
+enum ForceKind {
+    PlainText,
 }
 
 const SKIP_LOG_COMPRESS_UNDER_CHARS: usize = 2000;
@@ -109,6 +127,15 @@ struct Output {
 /// and it had zero direct test coverage before this existed only inline
 /// in `main()`.
 fn route(text: &str) -> (ContentKind, Output) {
+    route_with_override(text, None)
+}
+
+/// Same as `route`, but `forced_kind` — when given — skips `detect()`
+/// entirely instead of guessing. The caller-asserted path: a caller that
+/// already knows the content's shape (total-recall's persona ingestion
+/// knows a cleaned transcript is prose) shouldn't be at the mercy of a
+/// heuristic that can misclassify it.
+fn route_with_override(text: &str, forced_kind: Option<ContentKind>) -> (ContentKind, Output) {
     // Unconditional pre-pass, not a ContentKind of its own — a base64 blob
     // (an embedded screenshot, a data-URI) can appear inside any shape
     // detect() classifies below, so it's stripped before detection runs,
@@ -117,7 +144,7 @@ fn route(text: &str) -> (ContentKind, Output) {
     let (text, base64_blobs_removed) = strip_base64_blobs(text);
     let text = text.as_str();
 
-    let kind = detect(text);
+    let kind = forced_kind.unwrap_or_else(|| detect(text));
 
     let output = match &kind {
         ContentKind::Json => match compress_json_array(text) {
@@ -223,20 +250,42 @@ fn route(text: &str) -> (ContentKind, Output) {
                 match SemanticDedup::load()
                     .and_then(|mut d| d.dedupe(&deduped, PARAPHRASE_THRESHOLD))
                 {
-                    Ok(result) => Output {
-                        detail: Map::from_iter([
-                            (
-                                "sentences_before".to_string(),
-                                Value::from(result.original_sentences),
-                            ),
-                            (
-                                "sentences_after".to_string(),
-                                Value::from(result.kept_sentences),
-                            ),
-                        ]),
-                        compressed: result.content,
-                        source: "dedup+semantic",
-                    },
+                    Ok(result) => {
+                        let stories: Vec<Value> = result
+                            .kept
+                            .iter()
+                            .filter(|k| k.shape == SentenceShape::Narrative)
+                            .map(|k| Value::from(k.text.clone()))
+                            .collect();
+                        let traceability: Vec<Value> = result
+                            .drops
+                            .iter()
+                            .map(|d| {
+                                let mut m = Map::new();
+                                m.insert("dropped_index".to_string(), Value::from(d.dropped_index));
+                                m.insert("kept_index".to_string(), Value::from(d.kept_index));
+                                m.insert("similarity".to_string(), Value::from(d.similarity));
+                                Value::Object(m)
+                            })
+                            .collect();
+                        Output {
+                            detail: Map::from_iter([
+                                (
+                                    "sentences_before".to_string(),
+                                    Value::from(result.original_sentences),
+                                ),
+                                (
+                                    "sentences_after".to_string(),
+                                    Value::from(result.kept_sentences),
+                                ),
+                                ("summary".to_string(), Value::from(result.summary)),
+                                ("stories".to_string(), Value::from(stories)),
+                                ("drops".to_string(), Value::from(traceability)),
+                            ]),
+                            compressed: result.content,
+                            source: "dedup+semantic",
+                        }
+                    }
                     // Model unavailable (offline, first-run download
                     // failed) — line-dedup's result is still real
                     // compression, use it rather than failing outright.
@@ -447,7 +496,10 @@ fn main() {
         }
     };
 
-    let (kind, output) = route(&text);
+    let forced = cli.force_kind.map(|f| match f {
+        ForceKind::PlainText => ContentKind::PlainText,
+    });
+    let (kind, output) = route_with_override(&text, forced);
     let json = build_output(&text, &kind, output);
 
     if cli.json {
