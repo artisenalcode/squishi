@@ -9,6 +9,7 @@ use squishi::line_dedup::dedupe_line_runs;
 use squishi::log_compress::{LogCompressConfig, compress_log};
 use squishi::search_compress::compress_search_results;
 use squishi::semantic_dedup::SemanticDedup;
+use squishi::session_prune;
 
 #[derive(Parser)]
 #[command(
@@ -41,6 +42,35 @@ struct Cli {
     /// semantic-dedup). Ignored without --doctor.
     #[arg(long)]
     quick: bool,
+
+    /// Run structural session pruning against a Claude Code transcript
+    /// (JSONL) instead of compressing `text` (ignored when set). Same
+    /// "flag not subcommand" reasoning as --doctor.
+    #[arg(long, value_name = "TRANSCRIPT_PATH")]
+    session_prune: Option<std::path::PathBuf>,
+
+    /// With --session-prune, also run rule 2 (supersede a Write/Edit's
+    /// result once a later Read of the same path exists) — off by
+    /// default per the technical-board review's real false-positive
+    /// concern (2026-08-07). Ignored without --session-prune.
+    #[arg(long)]
+    include_rule_2: bool,
+
+    /// With --session-prune, minimum tool-result byte size counted by
+    /// the "prune old large outputs" rule.
+    #[arg(long, default_value_t = 2000)]
+    min_bytes: usize,
+
+    /// With --session-prune, how many of the most recent session items
+    /// are exempt from the "prune old large outputs" rule.
+    #[arg(long, default_value_t = 200)]
+    window: usize,
+
+    /// With --session-prune, write a pruned *copy* of the transcript to
+    /// this path instead of printing a stats report. Never mutates the
+    /// input transcript.
+    #[arg(long, value_name = "OUT_PATH")]
+    write: Option<std::path::PathBuf>,
 }
 
 const SKIP_LOG_COMPRESS_UNDER_CHARS: usize = 2000;
@@ -287,6 +317,61 @@ fn main() {
             }
         }
         std::process::exit(if report.has_failures() { 1 } else { 0 });
+    }
+
+    if let Some(path) = &cli.session_prune {
+        let jsonl = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: failed to read {}: {e}", path.display());
+                std::process::exit(2);
+            }
+        };
+        let items = session_prune::parse(&jsonl);
+        let candidates = session_prune::run(&items, cli.include_rule_2, cli.min_bytes, cli.window);
+
+        if let Some(out_path) = &cli.write {
+            let pruned = session_prune::apply_pruning(&jsonl, &candidates);
+            if let Err(e) = std::fs::write(out_path, &pruned) {
+                eprintln!("error: failed to write {}: {e}", out_path.display());
+                std::process::exit(2);
+            }
+        }
+
+        if cli.json {
+            let mut by_rule: Map<String, Value> = Map::new();
+            for c in &candidates {
+                let entry = by_rule
+                    .entry(c.rule.to_string())
+                    .or_insert_with(|| Value::from(0));
+                *entry = Value::from(entry.as_i64().unwrap_or(0) + 1);
+            }
+            let mut json = Map::new();
+            json.insert("candidates".to_string(), Value::from(candidates.len()));
+            json.insert(
+                "bytes_prunable".to_string(),
+                Value::from(candidates.iter().map(|c| c.bytes).sum::<usize>()),
+            );
+            json.insert("by_rule".to_string(), Value::Object(by_rule));
+            println!("{}", Value::Object(json));
+        } else {
+            let mut by_rule: std::collections::BTreeMap<&str, (usize, usize)> =
+                std::collections::BTreeMap::new();
+            for c in &candidates {
+                let entry = by_rule.entry(c.rule).or_default();
+                entry.0 += 1;
+                entry.1 += c.bytes;
+            }
+            for (rule, (count, bytes)) in &by_rule {
+                println!("{rule}: {count} candidates, {bytes} bytes prunable");
+            }
+            let total_bytes: usize = candidates.iter().map(|c| c.bytes).sum();
+            println!(
+                "total: {} candidates, {total_bytes} bytes prunable",
+                candidates.len()
+            );
+        }
+        return;
     }
 
     let text = match read_input(&cli) {

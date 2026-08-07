@@ -218,32 +218,54 @@ Real finding surfaced by this check, not assumed: `hf_hub::Api::new()`
 `HF_HOME` is silently ignored by that call path. `--doctor` reports this
 explicitly when `HF_HOME` is set but wouldn't take effect.
 
-## Remembered: the total-recall-kit ruleset (not built yet)
+## `session_prune` — structural pruning for Claude Code session transcripts
 
-`total-recall-kit` (deleted from `_labs`, evaluated for value first) had a
-second, different class of rule — not text compression, but **session
-pruning**: which whole tool-call results in a harness's conversation
-history can be dropped because a *later* item already supersedes them.
-Worth remembering as a distinct future mode, since it operates on
-structured session items (role + tool metadata), not raw text:
+A different problem from every compressor above: those operate on a
+single blob's *text shape*; `session_prune` operates on a transcript's
+*structure* (which tool ran, on what path, superseded by what). Real
+measurement found squishi's shape compressors barely touch real session
+transcripts — the one path that loads the expensive semantic model,
+`PlainText`, had zero qualifying blocks in a real 4713-line coding
+session; everything reads as code/diff/log-shaped. Session pruning is
+what actually finds signal in that content.
 
-- **Dedupe latest read** — an older `read` of a file is prunable once a
-  newer `read` of the same path exists in the session.
-- **Supersede write by read** — a `write`'s tool output is prunable once
-  a later `read` of the same path verifies it landed correctly.
-- **Drop redundant errors** — an error tool-output is prunable if an
+Originally speced from `total-recall-kit` (deleted from `_labs`,
+evaluated for value first), pressure-tested by a technical-advisor board
+review (2026-08-07) before being built:
+
+- **Dedupe latest read** — an older `Read` of a path is prunable once a
+  newer `Read` of the same path exists later in the session.
+- **Supersede write by read** *(off by default — see below)* — a
+  `Write`/`Edit`'s own tool result is prunable once a later `Read` of
+  the same path verifies it landed correctly.
+- **Drop redundant errors** — an error tool-result is prunable if an
   identical `(tool, content)` error already appeared earlier.
-- **Prune old large tool outputs** — outputs over N chars are prunable
-  once they're no longer within the last K messages (a recency window,
-  not an age cutoff).
-- **Collapse task launches** — repeated "background task launched" logs
-  collapse to the latest one.
+- **Prune old large tool outputs** — outputs over `--min-bytes` are
+  prunable once they're no longer within the last `--window` session
+  items (a recency window over item count, not a wall-clock cutoff).
+- **Collapse task launches** — repeated "running in background with
+  ID:" tool-results collapse to the latest one.
 
-None of this is implementable without a harness feeding squishi
-structured session data (role, tool name, path, timestamp) — today
-squishi only sees raw text. If a harness integration ever wants this,
-it's a new module (`session_prune`, say), not a bolt-on to `line_dedup`
-or `log_compress`.
+```
+squishi --session-prune <transcript.jsonl>                  # stats report, mutates nothing
+squishi --session-prune <transcript.jsonl> --json           # structured stats
+squishi --session-prune <transcript.jsonl> --write out.jsonl  # a pruned COPY, original untouched
+squishi --session-prune <transcript.jsonl> --include-rule-2   # also run the flagged rule
+```
+
+**Rule 2 ships off by default.** The board review flagged real
+false-positive risk — a write's content a later read didn't fully
+re-verify — so it's opt-in via `--include-rule-2` until real usage data
+justifies flipping the default.
+
+**No live transcript mutation, ever.** Confirmed against the real Claude
+Code hooks reference: no hook can rewrite a past transcript entry —
+`PostToolUse`'s `updatedToolOutput` only applies to the *current* tool
+call. `--write` always produces a new copy; the input transcript is
+never touched, by this tool or (today) by anything that could feed its
+output back into a live session automatically.
+
+Not a subcommand — same "flag not subcommand" reasoning as `--doctor`.
 
 ## Development
 
