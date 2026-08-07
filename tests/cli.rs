@@ -148,3 +148,63 @@ fn json_flag_still_works_when_content_comes_from_stdin() {
         serde_json::from_str(stdout.trim()).expect("stdout should be valid JSON");
     assert_eq!(value["kind"], "Json");
 }
+
+#[test]
+fn batch_mode_processes_multiple_items_and_returns_a_json_array_with_ids() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_squishi"))
+        .args(["--batch", "--force-kind", "plain-text"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn squishi binary");
+
+    let batch_input = r#"[
+        {"id": "one", "text": "first item, short enough to skip semantic dedup entirely."},
+        {"id": "two", "text": "second item, also short, a completely different id."}
+    ]"#;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(batch_input.as_bytes())
+        .expect("failed to write to stdin");
+
+    let output = child.wait_with_output().expect("failed to wait on child");
+    assert!(
+        output.status.success(),
+        "squishi --batch exited non-zero: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout should be a valid JSON array");
+    let array = value.as_array().expect("expected a JSON array");
+    assert_eq!(array.len(), 2);
+    assert_eq!(array[0]["id"], "one");
+    assert_eq!(array[0]["kind"], "PlainText");
+    assert_eq!(array[1]["id"], "two");
+    assert_eq!(array[1]["kind"], "PlainText");
+}
+
+#[test]
+fn batch_mode_rejects_malformed_stdin_with_a_clear_error() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_squishi"))
+        .arg("--batch")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn squishi binary");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"not valid json at all")
+        .expect("failed to write to stdin");
+
+    let output = child.wait_with_output().expect("failed to wait on child");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--batch"));
+}

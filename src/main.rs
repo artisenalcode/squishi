@@ -98,6 +98,19 @@ struct Cli {
     /// since detect() already identifies them reliably.
     #[arg(long, value_enum)]
     force_kind: Option<ForceKind>,
+
+    /// Process many texts in one process instead of one per invocation
+    /// (ignores `text`; reads a JSON array from stdin instead:
+    /// `[{"id": "...", "text": "..."}, ...]`). The real reason this
+    /// exists: a caller processing N texts by spawning N separate
+    /// `squishi` invocations pays for a fresh model load every time —
+    /// found 2026-08-08 batch-reingesting persona videos this way, each
+    /// one reloading the ~562MB punctuation model from scratch. Batch
+    /// mode loads once, reuses it across every item. Always emits the
+    /// full `--json` contract per item (plus `id`), as a JSON array —
+    /// there's no bare-text form for multiple outputs.
+    #[arg(long)]
+    batch: bool,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy)]
@@ -134,8 +147,37 @@ fn route(text: &str) -> (ContentKind, Output) {
 /// entirely instead of guessing. The caller-asserted path: a caller that
 /// already knows the content's shape (total-recall's persona ingestion
 /// knows a cleaned transcript is prose) shouldn't be at the mercy of a
-/// heuristic that can misclassify it.
+/// heuristic that can misclassify it. Single-shot: loads its own
+/// `SemanticDedup` (and, transitively, the punctuation-restoration
+/// model) fresh every call — see `--batch`'s handling in `main()` for the reused-model
+/// path a caller processing many texts in one process should use
+/// instead.
 fn route_with_override(text: &str, forced_kind: Option<ContentKind>) -> (ContentKind, Output) {
+    let mut dedup_cache = None;
+    route_impl(text, forced_kind, &mut dedup_cache)
+}
+
+/// Loads `SemanticDedup` into `cache` on first need, reused on every
+/// subsequent call — the ~90MB MiniLM model and (lazily, inside it) the
+/// ~562MB punctuation model both get paid for once per `cache`, not
+/// once per `route_impl` call. `route_with_override`'s single-shot path
+/// passes a fresh, discarded-after-use cache (same cost as before this
+/// existed); `--batch`'s loop in `main()` passes one cache shared across an entire
+/// batch — the real fix for a caller that was previously spawning one
+/// fresh `squishi` subprocess per item (found 2026-08-08: reingesting
+/// 19 persona videos this way reloaded the punctuation model 19 times).
+fn ensure_dedup_loaded(cache: &mut Option<SemanticDedup>) -> Result<&mut SemanticDedup, String> {
+    if cache.is_none() {
+        *cache = Some(SemanticDedup::load()?);
+    }
+    Ok(cache.as_mut().unwrap())
+}
+
+fn route_impl(
+    text: &str,
+    forced_kind: Option<ContentKind>,
+    dedup_cache: &mut Option<SemanticDedup>,
+) -> (ContentKind, Output) {
     // Unconditional pre-pass, not a ContentKind of its own — a base64 blob
     // (an embedded screenshot, a data-URI) can appear inside any shape
     // detect() classifies below, so it's stripped before detection runs,
@@ -247,8 +289,8 @@ fn route_with_override(text: &str, forced_kind: Option<ContentKind>) -> (Content
                     detail: Map::new(),
                 }
             } else {
-                match SemanticDedup::load()
-                    .and_then(|mut d| d.dedupe(&deduped, PARAPHRASE_THRESHOLD))
+                match ensure_dedup_loaded(dedup_cache)
+                    .and_then(|d| d.dedupe(&deduped, PARAPHRASE_THRESHOLD))
                 {
                     Ok(result) => {
                         let stories: Vec<Value> = result
@@ -340,6 +382,37 @@ fn build_output(text: &str, kind: &ContentKind, output: Output) -> Map<String, V
     json.insert("chars_after".to_string(), Value::from(chars_after));
     json.extend(output.detail);
     json
+}
+
+/// Parses `--batch`'s stdin contract: a JSON array of `{"id", "text"}`
+/// objects, returned as `(id, text)` pairs in the original order. Hand-
+/// parsed against `serde_json::Value` rather than a `#[derive(Deserialize)]`
+/// struct — same reasoning `build_output` already gives for not pulling
+/// in a derive dependency for a secondary, opt-in path.
+fn parse_batch_items(raw: &str) -> Result<Vec<(String, String)>, String> {
+    let value: Value =
+        serde_json::from_str(raw).map_err(|e| format!("--batch stdin must be valid JSON: {e}"))?;
+    let array = value
+        .as_array()
+        .ok_or_else(|| "--batch stdin must be a JSON array".to_string())?;
+
+    array
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let id = item
+                .get("id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("--batch item {i}: missing string field \"id\""))?
+                .to_string();
+            let text = item
+                .get("text")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("--batch item {i}: missing string field \"text\""))?
+                .to_string();
+            Ok((id, text))
+        })
+        .collect()
 }
 
 /// Resolve the content to compress: the positional argument if given,
@@ -492,6 +565,42 @@ fn main() {
         return;
     }
 
+    let forced = cli.force_kind.map(|f| match f {
+        ForceKind::PlainText => ContentKind::PlainText,
+    });
+
+    if cli.batch {
+        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            eprintln!(
+                "error: --batch reads a JSON array from stdin — pipe it in, don't run interactively"
+            );
+            std::process::exit(2);
+        }
+        let mut buf = String::new();
+        if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf) {
+            eprintln!("error: failed to read stdin: {e}");
+            std::process::exit(2);
+        }
+        let items = match parse_batch_items(&buf) {
+            Ok(items) => items,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
+        };
+
+        let mut dedup_cache = None;
+        let mut results = Vec::with_capacity(items.len());
+        for (id, item_text) in items {
+            let (kind, output) = route_impl(&item_text, forced.clone(), &mut dedup_cache);
+            let mut json = build_output(&item_text, &kind, output);
+            json.insert("id".to_string(), Value::from(id));
+            results.push(Value::Object(json));
+        }
+        println!("{}", Value::Array(results));
+        return;
+    }
+
     let text = match read_input(&cli) {
         Ok(text) => text,
         Err(e) => {
@@ -499,10 +608,6 @@ fn main() {
             std::process::exit(2);
         }
     };
-
-    let forced = cli.force_kind.map(|f| match f {
-        ForceKind::PlainText => ContentKind::PlainText,
-    });
     let (kind, output) = route_with_override(&text, forced);
     let json = build_output(&text, &kind, output);
 
@@ -516,6 +621,56 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- parse_batch_items: pure ---
+
+    #[test]
+    fn parse_batch_items_parses_a_real_array() {
+        let raw = r#"[{"id": "a", "text": "first"}, {"id": "b", "text": "second"}]"#;
+        let items = parse_batch_items(raw).unwrap();
+        assert_eq!(
+            items,
+            vec![
+                ("a".to_string(), "first".to_string()),
+                ("b".to_string(), "second".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_batch_items_rejects_a_non_array() {
+        let result = parse_batch_items(r#"{"id": "a", "text": "first"}"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_batch_items_rejects_an_item_missing_text() {
+        let result = parse_batch_items(r#"[{"id": "a"}]"#);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("item 0"));
+    }
+
+    #[test]
+    fn parse_batch_items_on_empty_array_returns_empty() {
+        assert_eq!(parse_batch_items("[]").unwrap(), Vec::new());
+    }
+
+    #[test]
+    #[ignore] // real model load attempt (network/cache), same convention as semantic_dedup.rs's own real-model tests
+    fn ensure_dedup_loaded_reuses_the_same_cache_across_calls() {
+        // Proves the cache slot is actually threaded through and not
+        // silently re-created on a second call. A failed load (no
+        // network) still exercises the "don't retry a known-failed
+        // load" path correctly either way.
+        let mut cache: Option<SemanticDedup> = None;
+        let first = ensure_dedup_loaded(&mut cache);
+        let first_was_ok = first.is_ok();
+        // Second call must not re-attempt the load if the first failed
+        // (cache stays None, not re-tried) or must reuse the same
+        // instance if it succeeded (cache stays Some).
+        let second = ensure_dedup_loaded(&mut cache);
+        assert_eq!(second.is_ok(), first_was_ok);
+    }
 
     #[test]
     fn json_array_routes_to_json_compressor() {
