@@ -1,46 +1,56 @@
 //! Restores real sentence-ending/comma punctuation on unpunctuated
 //! prose (real YouTube auto-captions have none — see
 //! `semantic_dedup.rs`'s `is_effectively_unpunctuated` for where this
-//! was first found). Non-LLM: a standard XLM-RoBERTa-large token-
-//! classification model (`ldenoue/fullstop-punctuation-multilang-large`,
-//! an ONNX mirror of `oliverguhr/fullstop-punctuation-multilang-large`),
-//! one label per token from a fixed 6-class set — the same shape as any
-//! NER model, not a generative/LLM call.
+//! was first found). Non-LLM: an XLM-RoBERTa token-classification
+//! model, one label per token from a fixed 6-class set — the same
+//! shape as any NER model, not a generative/LLM call.
 //!
-//! ONNX contract (confirmed via examples/probe_punctuation.rs, not
-//! assumed): inputs `input_ids`/`attention_mask` (int64,
-//! `[batch, seq]`) — no `token_type_ids`, XLM-RoBERTa doesn't use
-//! segment ids. Output `logits` (float32, `[batch, seq, 6]`), one of:
-//! 0=none, 1=".", 2=",", 3="?", 4="-", 5=":" (from the model's own
-//! `config.json` `id2label`).
+//! **Two models, same label scheme, `load()` picks automatically:**
+//! - **Base (default once converted)**: `oliverguhr/fullstop-
+//!   punctuation-multilingual-base`, 12 layers/768 hidden, converted
+//!   locally to a 278,254,995-byte quantized ONNX model by
+//!   `scripts/convert_punctuation_base_model.py` (no one publishes an
+//!   ONNX export of this one — ONNX file did not exist anywhere to
+//!   just fetch). `load()` uses this automatically when present at
+//!   `~/.cache/squishi/models/fullstop-punctuation-multilingual-base/`.
+//! - **Large (fallback for a fresh checkout)**: `ldenoue/fullstop-
+//!   punctuation-multilang-large` (561,884,470 bytes, an ONNX mirror
+//!   of `oliverguhr/fullstop-punctuation-multilang-large`, 24 layers/
+//!   1024 hidden), fetched via hf_hub same as before. Used only when
+//!   the local base-model path doesn't exist — the conversion script
+//!   is an optional one-time speedup, not a hard dependency.
 //!
-//! Real cost, flagged rather than hidden: this model is ~562MB
-//! quantized — 6x `semantic_dedup.rs`'s MiniLM (~90MB). A real,
-//! material disk/first-run-download cost, accepted because the
-//! alternative (the word-window fallback) produces genuinely choppy,
-//! mid-thought-cut text — see `semantic_dedup.rs`'s own module doc.
+//! Both share the same `id2label`: 0=none, 1=".", 2=",", 3="?", 4="-",
+//! 5=":" — confirmed for the large model via
+//! `examples/probe_punctuation.rs`, and for the base model directly
+//! from its `config.json` before converting (same training
+//! methodology/family, base is just fewer layers).
 //!
-//! **A smaller swap was evaluated and rejected, 2026-08-08.**
-//! `ldenoue/distilbert-punctuator` (DistilBERT, English-only, 67MB —
-//! 8.4x smaller, same tokenizer.json-based loading path, zero
-//! structural code change needed) measured 5.5x faster restore
-//! throughput on a real 6,662-word Hormozi transcript (18.8s → 3.4s;
-//! see `examples/time_punctuation.rs`). Rejected anyway: its output on
-//! that same real transcript had periods/commas inserted at
-//! grammatically wrong positions ("...you spend. More money 10
-//! million, ads very low trust and that's, it so I said a. Bunch of
-//! businesses...") — a genuine accuracy regression from DistilBERT's
-//! smaller capacity and different training data, not a wiring bug (the
-//! I/O contract was confirmed correct via
-//! `examples/probe_distilbert_punctuator.rs` first). Speed without
-//! correctness isn't a win for data feeding advisor persona synthesis.
-//! Left as a documented, accepted cost rather than shipping a faster-
-//! but-wrong pipeline. If revisited: the more promising unexplored
-//! option is `oliverguhr/fullstop-punctuation-multilingual-base` (same
-//! training methodology/family as the current model, just the smaller
-//! XLM-R-base variant instead of -large) — no ready-made ONNX mirror
-//! was found for it, so using it would require a real conversion step,
-//! not just a repo-id swap.
+//! **Measured on a real 6,662-word Hormozi transcript, 2026-08-08**
+//! (`examples/time_punctuation.rs`): large — 18.78s restore, 3.2s load,
+//! 354.7 words/sec. Base (real ONNX+int8, not the PyTorch estimate
+//! that motivated trying this) — **6.53s restore, 1.46s load, 1019.4
+//! words/sec — 2.87x faster**, and better than the 1.4x a PyTorch-only
+//! test predicted, as expected once quantization compounds the
+//! layer-count gain. Output stayed coherent, same 6-class scheme, no
+//! wording changes needed elsewhere in this file. Useful at real
+//! corpus scale — Alex Hormozi's corpus alone is ~500 videos.
+//!
+//! **A different, smaller swap was evaluated and rejected first,
+//! same day.** `ldenoue/distilbert-punctuator` (DistilBERT,
+//! English-only, 66,985,523 bytes — 8.4x smaller, same
+//! tokenizer.json-based loading path) measured 5.5x faster (18.8s →
+//! 3.4s) on the same transcript, but its output had periods/commas
+//! inserted at grammatically wrong positions ("...you spend. More
+//! money 10 million, ads very low trust and that's, it so I said a.
+//! Bunch of businesses...") — a genuine accuracy regression from
+//! DistilBERT's smaller capacity and different training data, not a
+//! wiring bug (I/O contract confirmed correct via
+//! `examples/probe_distilbert_punctuator.rs` first). Rejected: speed
+//! without correctness isn't a win for data feeding advisor persona
+//! synthesis. The base model above is the same training family as the
+//! already-proven large model, not an architecture swap — that's why
+//! it held up where DistilBERT didn't.
 
 use hf_hub::api::sync::Api;
 use ort::session::Session;
@@ -65,13 +75,51 @@ const SENTENCE_ENDERS: [&str; 2] = [".", "?"];
 /// here costs a little cross-chunk context, not correctness.
 const CHUNK_WORDS: usize = 300;
 
+/// Local-conversion path for the base model (see
+/// `scripts/convert_punctuation_base_model.py`). No one publishes an ONNX
+/// export of `oliverguhr/fullstop-punctuation-multilingual-base` on the
+/// Hub, so unlike the large model above there's no repo to fetch from —
+/// running the conversion script is what populates this path. Checked
+/// first in `load()`; falls back to the large model via hf_hub when
+/// absent, so the conversion is an optional one-time speedup, not a hard
+/// dependency for a fresh checkout.
+fn local_base_model_dir() -> Option<std::path::PathBuf> {
+    let mut dir = dirs::home_dir()?;
+    dir.push(".cache");
+    dir.push("squishi");
+    dir.push("models");
+    dir.push("fullstop-punctuation-multilingual-base");
+    if dir.join("model_quantized.onnx").exists() && dir.join("tokenizer.json").exists() {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
 pub struct PunctuationRestorer {
     session: Session,
     tokenizer: Tokenizer,
 }
 
 impl PunctuationRestorer {
+    /// Loads the base model from `local_base_model_dir()` when the
+    /// one-time conversion has been run (measured ~1.4x faster restore,
+    /// same 6-class label scheme, no accuracy regression on a real
+    /// transcript — see module doc), otherwise falls back to the large
+    /// model via hf_hub. Both paths produce a `PunctuationRestorer` with
+    /// identical `restore()` behavior; callers never need to know which
+    /// one loaded.
     pub fn load() -> Result<Self, String> {
+        if let Some(dir) = local_base_model_dir() {
+            let session = Session::builder()
+                .map_err(|e| e.to_string())?
+                .commit_from_file(dir.join("model_quantized.onnx"))
+                .map_err(|e| e.to_string())?;
+            let tokenizer =
+                Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| e.to_string())?;
+            return Ok(Self { session, tokenizer });
+        }
+
         let api = Api::new().map_err(|e| e.to_string())?;
         let repo = api.model(MODEL_REPO.to_string());
 
