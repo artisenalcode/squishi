@@ -19,6 +19,28 @@
 //! material disk/first-run-download cost, accepted because the
 //! alternative (the word-window fallback) produces genuinely choppy,
 //! mid-thought-cut text — see `semantic_dedup.rs`'s own module doc.
+//!
+//! **A smaller swap was evaluated and rejected, 2026-08-08.**
+//! `ldenoue/distilbert-punctuator` (DistilBERT, English-only, 67MB —
+//! 8.4x smaller, same tokenizer.json-based loading path, zero
+//! structural code change needed) measured 5.5x faster restore
+//! throughput on a real 6,662-word Hormozi transcript (18.8s → 3.4s;
+//! see `examples/time_punctuation.rs`). Rejected anyway: its output on
+//! that same real transcript had periods/commas inserted at
+//! grammatically wrong positions ("...you spend. More money 10
+//! million, ads very low trust and that's, it so I said a. Bunch of
+//! businesses...") — a genuine accuracy regression from DistilBERT's
+//! smaller capacity and different training data, not a wiring bug (the
+//! I/O contract was confirmed correct via
+//! `examples/probe_distilbert_punctuator.rs` first). Speed without
+//! correctness isn't a win for data feeding advisor persona synthesis.
+//! Left as a documented, accepted cost rather than shipping a faster-
+//! but-wrong pipeline. If revisited: the more promising unexplored
+//! option is `oliverguhr/fullstop-punctuation-multilingual-base` (same
+//! training methodology/family as the current model, just the smaller
+//! XLM-R-base variant instead of -large) — no ready-made ONNX mirror
+//! was found for it, so using it would require a real conversion step,
+//! not just a repo-id swap.
 
 use hf_hub::api::sync::Api;
 use ort::session::Session;
