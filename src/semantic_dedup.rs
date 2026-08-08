@@ -248,27 +248,43 @@ impl SemanticDedup {
     /// reassembles the survivors in original order. Sentences outside
     /// MIN_WORDS..MAX_WORDS are never dropped (not meaningfully
     /// comparable as whole-sentence paraphrases) — always kept as-is.
-    pub fn dedupe(&mut self, content: &str, threshold: f32) -> Result<DedupResult, String> {
+    ///
+    /// `allow_punctuation_restore` is a caller-asserted eligibility gate,
+    /// independent of `is_effectively_unpunctuated`'s content-based
+    /// check: even genuinely unpunctuated content never gets the
+    /// ~562MB model invoked if the caller sets this false. Real use
+    /// case — total-recall's persona ingestion knows structurally which
+    /// sources are raw YouTube auto-captions (need it) vs. Wikipedia/git
+    /// commit messages (already have real punctuation) — belt-and-
+    /// suspenders alongside the content check, not a replacement for it.
+    pub fn dedupe(
+        &mut self,
+        content: &str,
+        threshold: f32,
+        allow_punctuation_restore: bool,
+    ) -> Result<DedupResult, String> {
         let content = content.trim();
 
         // Try real punctuation restoration first when the input needs
-        // it — `restored` has to be declared here (not inside the `if`)
-        // so `text_for_split`'s borrow can outlive the branch.
+        // it and the caller allows it — `restored` has to be declared
+        // here (not inside the `if`) so `text_for_split`'s borrow can
+        // outlive the branch.
         let restored;
-        let (text_for_split, punctuation_restored) = if is_effectively_unpunctuated(content) {
-            match self
-                .punctuation_restorer()
-                .and_then(|r| r.restore(content).ok())
-            {
-                Some(r) => {
-                    restored = r;
-                    (restored.as_str(), true)
+        let (text_for_split, punctuation_restored) =
+            if allow_punctuation_restore && is_effectively_unpunctuated(content) {
+                match self
+                    .punctuation_restorer()
+                    .and_then(|r| r.restore(content).ok())
+                {
+                    Some(r) => {
+                        restored = r;
+                        (restored.as_str(), true)
+                    }
+                    None => (content, false),
                 }
-                None => (content, false),
-            }
-        } else {
-            (content, false)
-        };
+            } else {
+                (content, false)
+            };
 
         let sentences: Vec<&str> = split_sentences(text_for_split);
         let original_sentences = sentences.len();
@@ -505,7 +521,7 @@ mod tests {
         let content = "The quarterly report shows strong growth in revenue. \
                         The quarterly report shows strong growth in revenue. \
                         The quarterly report shows strong growth in revenue.";
-        let result = d.dedupe(content, 0.80).unwrap();
+        let result = d.dedupe(content, 0.80, true).unwrap();
         assert_eq!(result.original_sentences, 3);
         assert_eq!(result.kept_sentences, 1);
         assert_eq!(result.kept[0].index, 0);
@@ -517,7 +533,7 @@ mod tests {
         let mut d = SemanticDedup::load().unwrap();
         let content = "The system failed to connect to the database server. \
                         The database server could not be reached by the system.";
-        let result = d.dedupe(content, 0.80).unwrap();
+        let result = d.dedupe(content, 0.80, true).unwrap();
         assert_eq!(result.original_sentences, 2);
         assert_eq!(result.kept_sentences, 1);
         // The second sentence collapsed into the first — traceable, not
@@ -534,7 +550,7 @@ mod tests {
         let mut d = SemanticDedup::load().unwrap();
         let content = "The database connection failed after three retries. \
                         Quarterly revenue grew by twelve percent this year.";
-        let result = d.dedupe(content, 0.80).unwrap();
+        let result = d.dedupe(content, 0.80, true).unwrap();
         assert_eq!(result.original_sentences, 2);
         assert_eq!(result.kept_sentences, 2);
         assert!(result.drops.is_empty());
@@ -547,12 +563,28 @@ mod tests {
         // "Yes." / "Okay." are under MIN_WORDS — never candidates for
         // dropping, regardless of similarity.
         let content = "Yes. Yes. Yes.";
-        let result = d.dedupe(content, 0.80).unwrap();
+        let result = d.dedupe(content, 0.80, true).unwrap();
         assert_eq!(result.original_sentences, 3);
         assert_eq!(result.kept_sentences, 3);
         // Too few sentences for a summary to mean anything, and none
         // were ever embedded (all under MIN_WORDS) — summary stays empty.
         assert!(result.summary.is_empty());
+    }
+
+    #[test]
+    #[ignore]
+    fn allow_punctuation_restore_false_blocks_restoration_even_on_unpunctuated_text() {
+        let mut d = SemanticDedup::load().unwrap();
+        // Real shape: unpunctuated (would trigger restoration if
+        // allowed), but the caller explicitly disallows it here --
+        // real use case: total-recall marking a Wikipedia/git-commit
+        // source, which structurally never needs it, false.
+        let content: String = std::iter::repeat_n("word ", 60).collect();
+        let result = d.dedupe(&content, 0.80, false).unwrap();
+        assert!(!result.punctuation_restored);
+        // Still falls back to the word-window split -- disabling
+        // restoration doesn't mean the content goes unprocessed.
+        assert!(result.original_sentences > 1);
     }
 
     // --- split_sentences fallback: pure, no model ---

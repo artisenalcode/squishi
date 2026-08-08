@@ -143,6 +143,13 @@ fn route(text: &str) -> (ContentKind, Output) {
     route_with_override(text, None)
 }
 
+/// Same eligibility gate `SemanticDedup::dedupe` takes — see its own
+/// doc comment. Threaded down from `--batch`'s per-item field (default
+/// `true`, matching the pre-existing behavior this flag was added
+/// alongside) or `route`/`route_with_override`'s implicit `true`
+/// (single-shot callers have no per-item concept to gate on).
+const ALLOW_PUNCTUATION_RESTORE_DEFAULT: bool = true;
+
 /// Same as `route`, but `forced_kind` — when given — skips `detect()`
 /// entirely instead of guessing. The caller-asserted path: a caller that
 /// already knows the content's shape (total-recall's persona ingestion
@@ -154,7 +161,12 @@ fn route(text: &str) -> (ContentKind, Output) {
 /// instead.
 fn route_with_override(text: &str, forced_kind: Option<ContentKind>) -> (ContentKind, Output) {
     let mut dedup_cache = None;
-    route_impl(text, forced_kind, &mut dedup_cache)
+    route_impl(
+        text,
+        forced_kind,
+        &mut dedup_cache,
+        ALLOW_PUNCTUATION_RESTORE_DEFAULT,
+    )
 }
 
 /// Loads `SemanticDedup` into `cache` on first need, reused on every
@@ -177,6 +189,7 @@ fn route_impl(
     text: &str,
     forced_kind: Option<ContentKind>,
     dedup_cache: &mut Option<SemanticDedup>,
+    allow_punctuation_restore: bool,
 ) -> (ContentKind, Output) {
     // Unconditional pre-pass, not a ContentKind of its own — a base64 blob
     // (an embedded screenshot, a data-URI) can appear inside any shape
@@ -289,9 +302,9 @@ fn route_impl(
                     detail: Map::new(),
                 }
             } else {
-                match ensure_dedup_loaded(dedup_cache)
-                    .and_then(|d| d.dedupe(&deduped, PARAPHRASE_THRESHOLD))
-                {
+                match ensure_dedup_loaded(dedup_cache).and_then(|d| {
+                    d.dedupe(&deduped, PARAPHRASE_THRESHOLD, allow_punctuation_restore)
+                }) {
                     Ok(result) => {
                         let stories: Vec<Value> = result
                             .kept
@@ -384,12 +397,19 @@ fn build_output(text: &str, kind: &ContentKind, output: Output) -> Map<String, V
     json
 }
 
-/// Parses `--batch`'s stdin contract: a JSON array of `{"id", "text"}`
-/// objects, returned as `(id, text)` pairs in the original order. Hand-
-/// parsed against `serde_json::Value` rather than a `#[derive(Deserialize)]`
-/// struct — same reasoning `build_output` already gives for not pulling
-/// in a derive dependency for a secondary, opt-in path.
-fn parse_batch_items(raw: &str) -> Result<Vec<(String, String)>, String> {
+/// Parses `--batch`'s stdin contract: a JSON array of `{"id", "text",
+/// "restore_punctuation"}` objects, returned as `(id, text,
+/// allow_punctuation_restore)` triples in the original order.
+/// `restore_punctuation` is optional per item, defaulting to `true`
+/// (matches this flag's own pre-existing default, no behavior change
+/// for callers that don't set it) — a caller that knows a source never
+/// needs it (Wikipedia, git commit messages — already have real
+/// punctuation) sets it `false` explicitly rather than relying solely
+/// on the content-density heuristic. Hand-parsed against
+/// `serde_json::Value` rather than a `#[derive(Deserialize)]` struct —
+/// same reasoning `build_output` already gives for not pulling in a
+/// derive dependency for a secondary, opt-in path.
+fn parse_batch_items(raw: &str) -> Result<Vec<(String, String, bool)>, String> {
     let value: Value =
         serde_json::from_str(raw).map_err(|e| format!("--batch stdin must be valid JSON: {e}"))?;
     let array = value
@@ -410,7 +430,11 @@ fn parse_batch_items(raw: &str) -> Result<Vec<(String, String)>, String> {
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| format!("--batch item {i}: missing string field \"text\""))?
                 .to_string();
-            Ok((id, text))
+            let allow_punctuation_restore = item
+                .get("restore_punctuation")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(ALLOW_PUNCTUATION_RESTORE_DEFAULT);
+            Ok((id, text, allow_punctuation_restore))
         })
         .collect()
 }
@@ -591,8 +615,13 @@ fn main() {
 
         let mut dedup_cache = None;
         let mut results = Vec::with_capacity(items.len());
-        for (id, item_text) in items {
-            let (kind, output) = route_impl(&item_text, forced.clone(), &mut dedup_cache);
+        for (id, item_text, allow_punctuation_restore) in items {
+            let (kind, output) = route_impl(
+                &item_text,
+                forced.clone(),
+                &mut dedup_cache,
+                allow_punctuation_restore,
+            );
             let mut json = build_output(&item_text, &kind, output);
             json.insert("id".to_string(), Value::from(id));
             results.push(Value::Object(json));
@@ -628,12 +657,38 @@ mod tests {
     fn parse_batch_items_parses_a_real_array() {
         let raw = r#"[{"id": "a", "text": "first"}, {"id": "b", "text": "second"}]"#;
         let items = parse_batch_items(raw).unwrap();
+        // Neither item set restore_punctuation -- both default to true.
         assert_eq!(
             items,
             vec![
-                ("a".to_string(), "first".to_string()),
-                ("b".to_string(), "second".to_string())
+                ("a".to_string(), "first".to_string(), true),
+                ("b".to_string(), "second".to_string(), true)
             ]
+        );
+    }
+
+    #[test]
+    fn parse_batch_items_honors_an_explicit_restore_punctuation_false() {
+        let raw = r#"[
+            {"id": "yt-video", "text": "unpunctuated caption text"},
+            {"id": "wikipedia-page", "text": "Real prose.", "restore_punctuation": false}
+        ]"#;
+        let items = parse_batch_items(raw).unwrap();
+        assert_eq!(
+            items[0],
+            (
+                "yt-video".to_string(),
+                "unpunctuated caption text".to_string(),
+                true
+            )
+        );
+        assert_eq!(
+            items[1],
+            (
+                "wikipedia-page".to_string(),
+                "Real prose.".to_string(),
+                false
+            )
         );
     }
 

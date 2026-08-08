@@ -187,6 +187,45 @@ fn batch_mode_processes_multiple_items_and_returns_a_json_array_with_ids() {
 }
 
 #[test]
+#[ignore] // real model load (network/cache) — proves restore_punctuation:false actually blocks it end to end
+fn batch_mode_restore_punctuation_false_blocks_restoration_on_real_unpunctuated_text() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_squishi"))
+        .args(["--batch", "--force-kind", "plain-text"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn squishi binary");
+
+    // Real shape: long enough (over SKIP_SEMANTIC_DEDUP_UNDER_CHARS) and
+    // genuinely unpunctuated (would trigger restoration if allowed) —
+    // the exact shape a YouTube-caption transcript has, but here marked
+    // as ineligible, same as total-recall would mark a Wikipedia/git
+    // source.
+    let sentence = "hello and welcome to this transcript we are going to talk about many things today including neuroscience and psychology and how the brain actually works when it comes to emotion ";
+    let long_unpunctuated: String = std::iter::repeat_n(sentence, 20).collect();
+    let batch_input = serde_json::json!([
+        {"id": "should-be-blocked", "text": long_unpunctuated, "restore_punctuation": false}
+    ]);
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(batch_input.to_string().as_bytes())
+        .expect("failed to write to stdin");
+
+    let output = child.wait_with_output().expect("failed to wait on child");
+    assert!(
+        output.status.success(),
+        "squishi --batch exited non-zero: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout should be a valid JSON array");
+    assert_eq!(value[0]["punctuation_restored"], false);
+}
+
+#[test]
 fn batch_mode_rejects_malformed_stdin_with_a_clear_error() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_squishi"))
         .arg("--batch")
