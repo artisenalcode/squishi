@@ -33,10 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let restored = restorer.restore(&content)?;
     let elapsed = restore_start.elapsed();
     println!("restore time: {elapsed:?}");
-    println!(
-        "chunks: {}",
-        word_count.div_ceil(300)
-    );
+    println!("chunks: {}", word_count.div_ceil(300));
     println!(
         "words/sec: {:.1}",
         word_count as f64 / elapsed.as_secs_f64()

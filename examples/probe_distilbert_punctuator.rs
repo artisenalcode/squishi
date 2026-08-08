@@ -23,7 +23,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("fetching tokenizer.json...");
     let tok = repo.get("tokenizer.json")?;
-    println!("  -> {} ({} bytes)", tok.display(), std::fs::metadata(&tok)?.len());
+    println!(
+        "  -> {} ({} bytes)",
+        tok.display(),
+        std::fs::metadata(&tok)?.len()
+    );
 
     println!("loading session...");
     let session = Session::builder()?.commit_from_file(&quantized)?;

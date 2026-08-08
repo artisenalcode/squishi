@@ -167,7 +167,11 @@ impl PunctuationRestorer {
             .collect::<Result<_, _>>()
             .map_err(|e| e.to_string())?;
 
-        let max_len = encodings.iter().map(|e| e.get_ids().len()).max().unwrap_or(0);
+        let max_len = encodings
+            .iter()
+            .map(|e| e.get_ids().len())
+            .max()
+            .unwrap_or(0);
         let batch_size = encodings.len();
 
         let mut ids = vec![self.pad_id; batch_size * max_len];
