@@ -5,26 +5,19 @@
 //! model, one label per token from a fixed 6-class set — the same
 //! shape as any NER model, not a generative/LLM call.
 //!
-//! **Two models, same label scheme, `load()` picks automatically:**
-//! - **Base (default once converted)**: `oliverguhr/fullstop-
-//!   punctuation-multilingual-base`, 12 layers/768 hidden, converted
-//!   locally to a 278,254,995-byte quantized ONNX model by
-//!   `scripts/convert_punctuation_base_model.py` (no one publishes an
-//!   ONNX export of this one — ONNX file did not exist anywhere to
-//!   just fetch). `load()` uses this automatically when present at
-//!   `~/.cache/squishi/models/fullstop-punctuation-multilingual-base/`.
-//! - **Large (fallback for a fresh checkout)**: `ldenoue/fullstop-
-//!   punctuation-multilang-large` (561,884,470 bytes, an ONNX mirror
-//!   of `oliverguhr/fullstop-punctuation-multilang-large`, 24 layers/
-//!   1024 hidden), fetched via hf_hub same as before. Used only when
-//!   the local base-model path doesn't exist — the conversion script
-//!   is an optional one-time speedup, not a hard dependency.
-//!
-//! Both share the same `id2label`: 0=none, 1=".", 2=",", 3="?", 4="-",
-//! 5=":" — confirmed for the large model via
-//! `examples/probe_punctuation.rs`, and for the base model directly
-//! from its `config.json` before converting (same training
-//! methodology/family, base is just fewer layers).
+//! **Model: `oliverguhr/fullstop-punctuation-multilingual-base`,**
+//! 12 layers/768 hidden, converted locally to a 278,254,995-byte
+//! quantized ONNX model by `scripts/convert_punctuation_base_model.py`
+//! (no one publishes an ONNX export of this one — it did not exist
+//! anywhere to just fetch). `load()` requires this at
+//! `~/.cache/squishi/models/fullstop-punctuation-multilingual-base/` —
+//! run the conversion script first; there's no automatic fallback to
+//! the old large model (`ldenoue/fullstop-punctuation-multilang-large`,
+//! 24 layers/1024 hidden) anymore, dropped 2026-08-08 to keep this
+//! module to one path. `id2label`: 0=none, 1=".", 2=",", 3="?", 4="-",
+//! 5=":", confirmed from the base model's own `config.json` before
+//! converting — same scheme as the large model it replaced (same
+//! training methodology/family, base is just fewer layers).
 //!
 //! **Measured on a real 6,662-word Hormozi transcript, 2026-08-08**
 //! (`examples/time_punctuation.rs`): large — 18.78s restore, 3.2s load,
@@ -52,13 +45,9 @@
 //! already-proven large model, not an architecture swap — that's why
 //! it held up where DistilBERT didn't.
 
-use hf_hub::api::sync::Api;
 use ort::session::Session;
 use ort::value::TensorRef;
 use tokenizers::Tokenizer;
-
-const MODEL_REPO: &str = "ldenoue/fullstop-punctuation-multilang-large";
-const ONNX_FILENAME: &str = "onnx/model_quantized.onnx";
 
 /// The model's own `id2label` (config.json), index-matched to argmax
 /// position in the logits' last dimension.
@@ -75,70 +64,72 @@ const SENTENCE_ENDERS: [&str; 2] = [".", "?"];
 /// here costs a little cross-chunk context, not correctness.
 const CHUNK_WORDS: usize = 300;
 
-/// Local-conversion path for the base model (see
-/// `scripts/convert_punctuation_base_model.py`). No one publishes an ONNX
-/// export of `oliverguhr/fullstop-punctuation-multilingual-base` on the
-/// Hub, so unlike the large model above there's no repo to fetch from —
-/// running the conversion script is what populates this path. Checked
-/// first in `load()`; falls back to the large model via hf_hub when
-/// absent, so the conversion is an optional one-time speedup, not a hard
-/// dependency for a fresh checkout.
+/// How many chunks go into one `session.run()` call. Batching real
+/// work into fewer, larger calls (padded to the batch's own longest
+/// chunk) measured faster than one call per chunk on the same CPU this
+/// whole investigation was benchmarked on — see module doc for the
+/// numbers. 8 chosen as a real, moderate batch: large enough to cut
+/// per-call overhead meaningfully, small enough that padding waste
+/// from one short last-chunk-in-a-video doesn't dominate.
+const BATCH_SIZE: usize = 8;
+
+/// Where `scripts/convert_punctuation_base_model.py` writes the
+/// converted model. No fallback to any other model — run the
+/// conversion script first (see module doc); `load()` errors clearly
+/// if this path is missing rather than silently using something
+/// slower.
 fn local_base_model_dir() -> Option<std::path::PathBuf> {
     let mut dir = dirs::home_dir()?;
     dir.push(".cache");
     dir.push("squishi");
     dir.push("models");
     dir.push("fullstop-punctuation-multilingual-base");
-    if dir.join("model_quantized.onnx").exists() && dir.join("tokenizer.json").exists() {
-        Some(dir)
-    } else {
-        None
-    }
+    Some(dir)
 }
 
 pub struct PunctuationRestorer {
     session: Session,
     tokenizer: Tokenizer,
+    pad_id: i64,
 }
 
 impl PunctuationRestorer {
-    /// Loads the base model from `local_base_model_dir()` when the
-    /// one-time conversion has been run (measured ~1.4x faster restore,
-    /// same 6-class label scheme, no accuracy regression on a real
-    /// transcript — see module doc), otherwise falls back to the large
-    /// model via hf_hub. Both paths produce a `PunctuationRestorer` with
-    /// identical `restore()` behavior; callers never need to know which
-    /// one loaded.
     pub fn load() -> Result<Self, String> {
-        if let Some(dir) = local_base_model_dir() {
-            let session = Session::builder()
-                .map_err(|e| e.to_string())?
-                .commit_from_file(dir.join("model_quantized.onnx"))
-                .map_err(|e| e.to_string())?;
-            let tokenizer =
-                Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| e.to_string())?;
-            return Ok(Self { session, tokenizer });
+        let dir = local_base_model_dir()
+            .ok_or_else(|| "could not resolve home directory for model cache".to_string())?;
+        let onnx_path = dir.join("model_quantized.onnx");
+        let tokenizer_path = dir.join("tokenizer.json");
+        if !onnx_path.exists() || !tokenizer_path.exists() {
+            return Err(format!(
+                "punctuation model not found at {} -- run `python3 scripts/convert_punctuation_base_model.py` first",
+                dir.display()
+            ));
         }
-
-        let api = Api::new().map_err(|e| e.to_string())?;
-        let repo = api.model(MODEL_REPO.to_string());
-
-        let onnx_path = repo.get(ONNX_FILENAME).map_err(|e| e.to_string())?;
-        let tokenizer_path = repo.get("tokenizer.json").map_err(|e| e.to_string())?;
 
         let session = Session::builder()
             .map_err(|e| e.to_string())?
             .commit_from_file(&onnx_path)
             .map_err(|e| e.to_string())?;
         let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| e.to_string())?;
+        // XLM-RoBERTa's pad token is "<pad>", id 1 -- not 0. Read it
+        // from the tokenizer itself rather than hardcoding, so a
+        // tokenizer swap can't silently pad with the wrong id.
+        let pad_id = tokenizer.token_to_id("<pad>").unwrap_or(1) as i64;
 
-        Ok(Self { session, tokenizer })
+        Ok(Self {
+            session,
+            tokenizer,
+            pad_id,
+        })
     }
 
     /// Restores punctuation and sentence-start capitalization on
     /// `content`, chunking by word count to stay inside the model's
-    /// position-embedding limit. Chunks are processed independently and
-    /// rejoined — a chunk boundary mid-sentence is the one known
+    /// position-embedding limit. Chunks are processed `BATCH_SIZE` at a
+    /// time in one padded `session.run()` call each, not one call per
+    /// chunk — real, measured win (see module doc) from letting ONNX
+    /// Runtime work on a bigger unit per call instead of many small
+    /// sequential ones. A chunk boundary mid-sentence is the one known
     /// artifact this doesn't handle (no overlap/fusion, unlike the
     /// reference `punctuators` package), acceptable for a real-but-not-
     /// perfect improvement over the word-window fallback it replaces.
@@ -148,32 +139,52 @@ impl PunctuationRestorer {
             return Ok(String::new());
         }
 
-        let mut restored_chunks = Vec::new();
-        for chunk_words in words.chunks(CHUNK_WORDS) {
-            let chunk_text = chunk_words.join(" ");
-            restored_chunks.push(self.restore_chunk(&chunk_text)?);
+        let chunk_texts: Vec<String> = words
+            .chunks(CHUNK_WORDS)
+            .map(|chunk_words| chunk_words.join(" "))
+            .collect();
+
+        let mut restored_chunks = Vec::with_capacity(chunk_texts.len());
+        for batch in chunk_texts.chunks(BATCH_SIZE) {
+            restored_chunks.extend(self.restore_batch(batch)?);
         }
         Ok(restored_chunks.join(" "))
     }
 
-    fn restore_chunk(&mut self, chunk: &str) -> Result<String, String> {
-        let encoding = self
-            .tokenizer
-            .encode(chunk, true)
-            .map_err(|e| e.to_string())?;
-
-        let ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
-        let mask: Vec<i64> = encoding
-            .get_attention_mask()
+    /// Runs one or more chunks through a single `session.run()` call,
+    /// padded to the batch's own longest chunk (not the model's 514
+    /// ceiling — real waste reduction when most chunks in a batch are
+    /// close to `CHUNK_WORDS` and only the last one in a video is
+    /// short). Padded positions get `attention_mask = 0` and are never
+    /// read back out: `word_ids` from the tokenizer is `None` for pad
+    /// tokens, and the existing per-word label mapping already skips
+    /// `None` — padding-awareness falls out of code that already
+    /// existed for the single-chunk case, not new filtering logic.
+    fn restore_batch(&mut self, chunks: &[String]) -> Result<Vec<String>, String> {
+        let encodings: Vec<_> = chunks
             .iter()
-            .map(|&m| m as i64)
-            .collect();
-        let word_ids: Vec<Option<u32>> = encoding.get_word_ids().to_vec();
-        let seq_len = ids.len();
-
-        let input_ids = TensorRef::from_array_view(([1, seq_len], ids.as_slice()))
+            .map(|c| self.tokenizer.encode(c.as_str(), true))
+            .collect::<Result<_, _>>()
             .map_err(|e| e.to_string())?;
-        let attention_mask = TensorRef::from_array_view(([1, seq_len], mask.as_slice()))
+
+        let max_len = encodings.iter().map(|e| e.get_ids().len()).max().unwrap_or(0);
+        let batch_size = encodings.len();
+
+        let mut ids = vec![self.pad_id; batch_size * max_len];
+        let mut mask = vec![0i64; batch_size * max_len];
+        for (row, encoding) in encodings.iter().enumerate() {
+            let row_ids = encoding.get_ids();
+            let row_mask = encoding.get_attention_mask();
+            let offset = row * max_len;
+            for (col, (&id, &m)) in row_ids.iter().zip(row_mask.iter()).enumerate() {
+                ids[offset + col] = id as i64;
+                mask[offset + col] = m as i64;
+            }
+        }
+
+        let input_ids = TensorRef::from_array_view(([batch_size, max_len], ids.as_slice()))
+            .map_err(|e| e.to_string())?;
+        let attention_mask = TensorRef::from_array_view(([batch_size, max_len], mask.as_slice()))
             .map_err(|e| e.to_string())?;
 
         let outputs = self
@@ -189,34 +200,45 @@ impl PunctuationRestorer {
             .map_err(|e| e.to_string())?;
         let num_labels = *shape.last().unwrap_or(&(LABELS.len() as i64)) as usize;
 
-        // One predicted label per subtoken (argmax over the last dim).
-        let token_labels: Vec<usize> = (0..seq_len)
-            .map(|i| {
-                let start = i * num_labels;
-                let slice = &logits[start..start + num_labels];
-                slice
-                    .iter()
-                    .enumerate()
-                    .max_by(|a, b| a.1.total_cmp(b.1))
-                    .map(|(idx, _)| idx)
-                    .unwrap_or(0)
-            })
-            .collect();
+        let mut results = Vec::with_capacity(batch_size);
+        for (row, (chunk, encoding)) in chunks.iter().zip(encodings.iter()).enumerate() {
+            let row_len = encoding.get_ids().len();
+            let word_ids = encoding.get_word_ids();
+            let row_offset = row * max_len * num_labels;
 
-        // A word's punctuation is decided by its LAST subtoken's
-        // prediction — punctuation attaches to the end of a word, and a
-        // word can span multiple subtokens under SentencePiece.
-        let mut word_label: Vec<usize> = vec![0; chunk.split_whitespace().count()];
-        for (token_index, word_id) in word_ids.iter().enumerate() {
-            if let Some(w) = word_id {
-                let w = *w as usize;
-                if w < word_label.len() {
-                    word_label[w] = token_labels[token_index];
+            // One predicted label per real (non-padded) subtoken in
+            // this row — argmax over the last dim.
+            let token_labels: Vec<usize> = (0..row_len)
+                .map(|i| {
+                    let start = row_offset + i * num_labels;
+                    let slice = &logits[start..start + num_labels];
+                    slice
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.total_cmp(b.1))
+                        .map(|(idx, _)| idx)
+                        .unwrap_or(0)
+                })
+                .collect();
+
+            // A word's punctuation is decided by its LAST subtoken's
+            // prediction — punctuation attaches to the end of a word,
+            // and a word can span multiple subtokens under
+            // SentencePiece.
+            let mut word_label: Vec<usize> = vec![0; chunk.split_whitespace().count()];
+            for (token_index, word_id) in word_ids.iter().enumerate().take(row_len) {
+                if let Some(w) = word_id {
+                    let w = *w as usize;
+                    if w < word_label.len() {
+                        word_label[w] = token_labels[token_index];
+                    }
                 }
             }
+
+            results.push(reconstruct(chunk, &word_label));
         }
 
-        Ok(reconstruct(chunk, &word_label))
+        Ok(results)
     }
 }
 
