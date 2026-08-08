@@ -45,9 +45,9 @@
     "semantic_hash": "e07668a46bbd6411990a30ad5462def2"
   },
   "src/main.rs": {
-    "mtime": 1785983308.9028077,
-    "ast_hash": "4c468a72fd0a51e0cf1ac17f39704542",
-    "semantic_hash": "4c468a72fd0a51e0cf1ac17f39704542"
+    "mtime": 1785996706.6916308,
+    "ast_hash": "af6d48f387e1b9b1f3efe3ab7f9e5e84",
+    "semantic_hash": "af6d48f387e1b9b1f3efe3ab7f9e5e84"
   },
   "src/search_compress.rs": {
     "mtime": 1785939985.9819148,
@@ -58,5 +58,20 @@
     "mtime": 1785980798.6996431,
     "ast_hash": "8e5310f7a438dddf3e9458ffde72291a",
     "semantic_hash": "8e5310f7a438dddf3e9458ffde72291a"
+  },
+  ".claude/settings.json": {
+    "mtime": 1786001363.7364395,
+    "ast_hash": "ffb36e388dc61cebf554e0fd969df260",
+    "semantic_hash": "ffb36e388dc61cebf554e0fd969df260"
+  },
+  "scripts/claude-code-posttooluse-hook.sh": {
+    "mtime": 1785999056.6027277,
+    "ast_hash": "ece78d73d463577d3d18fc197abe69c8",
+    "semantic_hash": "ece78d73d463577d3d18fc197abe69c8"
+  },
+  "tests/cli.rs": {
+    "mtime": 1785996509.6316955,
+    "ast_hash": "f5388405b8a591cbf2a6512214c31c58",
+    "semantic_hash": "f5388405b8a591cbf2a6512214c31c58"
   }
 }
