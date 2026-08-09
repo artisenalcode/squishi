@@ -87,6 +87,15 @@ struct Cli {
     #[arg(long, default_value_t = 100_000)]
     max_chars: usize,
 
+    /// With --session-digest, skip the first N physical lines of the
+    /// transcript before extracting (ADR-0006 Phase 2) — an incremental
+    /// caller re-reads the same, still-growing transcript on each call
+    /// and passes the previous call's `total_lines` (from `--json`) here,
+    /// getting back only the delta since then. `0` (default) is the
+    /// original whole-file behavior.
+    #[arg(long, default_value_t = 0)]
+    start_line: usize,
+
     /// Skip shape detection and force this content kind — for a caller
     /// that already knows structurally what it's staging (e.g. total-
     /// recall's persona ingestion knows a cleaned YouTube-caption
@@ -547,10 +556,19 @@ fn main() {
                 std::process::exit(2);
             }
         };
-        let (extracted, meta) = session_digest::extract_session_text(&jsonl, cli.max_chars);
+        let (extracted, meta) =
+            session_digest::extract_session_text(&jsonl, cli.max_chars, cli.start_line);
         if extracted.trim().is_empty() {
-            eprintln!("nothing to digest (empty session)");
-            std::process::exit(1);
+            // A genuinely empty whole-file digest is still worth failing
+            // loudly on (today's behavior, unchanged). An incremental
+            // call (start_line > 0) coming back empty is normal, not an
+            // error -- "nothing new since the last checkpoint" -- so it
+            // falls through to the same success path below, still
+            // carrying `total_lines` the caller needs regardless.
+            if cli.start_line == 0 {
+                eprintln!("nothing to digest (empty session)");
+                std::process::exit(1);
+            }
         }
         let chars_before = extracted.len();
         let (_, compress_output) = route(&extracted);
@@ -580,6 +598,7 @@ fn main() {
             json.insert("turn_count".to_string(), Value::from(meta.turn_count));
             json.insert("truncated".to_string(), Value::from(meta.truncated));
             json.insert("raw_bytes".to_string(), Value::from(meta.raw_bytes));
+            json.insert("total_lines".to_string(), Value::from(meta.total_lines));
             json.insert("chars_before".to_string(), Value::from(chars_before));
             json.insert("chars_after".to_string(), Value::from(chars_after));
             println!("{}", Value::Object(json));

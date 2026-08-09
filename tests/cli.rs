@@ -247,3 +247,94 @@ fn batch_mode_rejects_malformed_stdin_with_a_clear_error() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--batch"));
 }
+
+// --- --session-digest --start-line (ADR-0006 Phase 2) ---
+
+fn run_session_digest(transcript_path: &std::path::Path, start_line: usize) -> serde_json::Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_squishi"))
+        .arg("--session-digest")
+        .arg(transcript_path)
+        .arg("--start-line")
+        .arg(start_line.to_string())
+        .arg("--json")
+        .output()
+        .expect("failed to run squishi binary");
+
+    assert!(
+        output.status.success(),
+        "squishi --session-digest exited non-zero: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout was not valid JSON ({e}): {stdout:?}"))
+}
+
+/// The real incremental contract: a second call using the first call's
+/// own `total_lines` as `--start-line` returns only the delta, and that
+/// delta is a strict suffix of what a whole-file (`--start-line 0`) call
+/// against the same, now-longer transcript would produce.
+#[test]
+fn start_line_from_a_prior_calls_total_lines_yields_a_strict_suffix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("sess.jsonl");
+    let first_turn = r#"{"type":"user","sessionId":"s","cwd":"/repo","timestamp":"t1","message":{"role":"user","content":[{"type":"text","text":"first real question"}]}}"#;
+    std::fs::write(&path, format!("{first_turn}\n")).unwrap();
+
+    let first = run_session_digest(&path, 0);
+    let total_lines_after_first = first["total_lines"].as_u64().unwrap();
+    assert!(total_lines_after_first >= 1);
+
+    let second_turn = r#"{"type":"assistant","sessionId":"s","cwd":"/repo","timestamp":"t2","message":{"role":"assistant","content":[{"type":"text","text":"second real answer"}]}}"#;
+    std::fs::write(&path, format!("{first_turn}\n{second_turn}\n")).unwrap();
+
+    let incremental = run_session_digest(&path, total_lines_after_first as usize);
+    let whole_file = run_session_digest(&path, 0);
+
+    let incremental_content = incremental["content"].as_str().unwrap();
+    let whole_file_content = whole_file["content"].as_str().unwrap();
+    assert!(
+        whole_file_content.ends_with(incremental_content.rsplit("\n\n").next().unwrap()),
+        "incremental digest's real content should appear as a suffix of the whole-file digest"
+    );
+    assert!(incremental_content.contains("second real answer"));
+    assert!(!incremental_content.contains("first real question"));
+}
+
+/// An incremental call that lands on a transcript with nothing new since
+/// the checkpoint must succeed (exit 0, valid JSON with total_lines) --
+/// NOT the "empty session" hard failure a whole-file call still gets.
+#[test]
+fn start_line_with_nothing_new_succeeds_instead_of_failing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("sess.jsonl");
+    let only_turn = r#"{"type":"user","sessionId":"s","cwd":"/repo","timestamp":"t1","message":{"role":"user","content":[{"type":"text","text":"only turn"}]}}"#;
+    std::fs::write(&path, format!("{only_turn}\n")).unwrap();
+
+    let first = run_session_digest(&path, 0);
+    let total_lines = first["total_lines"].as_u64().unwrap();
+
+    // Same file, no new lines appended -- start_line == total_lines.
+    let second = run_session_digest(&path, total_lines as usize);
+    assert_eq!(second["turn_count"], 0);
+    assert_eq!(second["total_lines"], total_lines);
+}
+
+/// Regression: a truly empty whole-file digest (start_line 0, no real
+/// content anywhere) must still fail loudly -- Phase 2 only relaxed the
+/// empty-result check for incremental (start_line > 0) calls.
+#[test]
+fn start_line_zero_on_a_genuinely_empty_session_still_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("empty.jsonl");
+    std::fs::write(&path, "").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_squishi"))
+        .arg("--session-digest")
+        .arg(&path)
+        .output()
+        .expect("failed to run squishi binary");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("nothing to digest"));
+}

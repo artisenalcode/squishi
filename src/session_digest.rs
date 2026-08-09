@@ -28,6 +28,13 @@ pub struct SessionMeta {
     pub turn_count: usize,
     pub truncated: bool,
     pub raw_bytes: usize,
+    /// Total physical lines in the `jsonl` passed to `extract_session_text`
+    /// — independent of `start_line` (counted even over skipped lines).
+    /// A caller doing incremental extraction across repeated calls against
+    /// the same (growing, append-only) transcript saves this verbatim as
+    /// the next call's `start_line`, so each call only re-processes what's
+    /// new since the last one (ADR-0006 Phase 2).
+    pub total_lines: usize,
 }
 
 /// Strip a trailing `<system-reminder>...</...>` block — everything
@@ -64,15 +71,34 @@ fn truncate_middle(text: &str, max_chars: usize) -> (String, bool) {
 /// line is skipped, never a hard error — same discipline as
 /// `session_prune::parse`, same reason (transcript JSONL isn't a
 /// versioned contract).
-pub fn extract_session_text(jsonl: &str, max_chars: usize) -> (String, SessionMeta) {
+///
+/// `start_line` (ADR-0006 Phase 2) skips the first N physical lines of
+/// `jsonl` before extracting — `jsonl` is still the FULL current
+/// transcript (re-read fresh each call, not a slice), so an incremental
+/// caller passes the same growing file with an advancing `start_line`
+/// each time, getting back only the delta since the previous call. Pass
+/// `0` for the original whole-file behavior.
+pub fn extract_session_text(
+    jsonl: &str,
+    max_chars: usize,
+    start_line: usize,
+) -> (String, SessionMeta) {
     let mut lines_out: Vec<String> = Vec::new();
     let mut turn_count = 0usize;
     let mut session_id = None;
     let mut cwd = None;
     let mut first_ts = None;
     let mut last_ts = None;
+    let mut total_lines = 0usize;
 
-    for line in jsonl.lines() {
+    for (idx, line) in jsonl.lines().enumerate() {
+        // Counted regardless of the start_line skip below, so
+        // `total_lines` always reflects the FULL current input -- what an
+        // incremental caller needs to save as its next `start_line`.
+        total_lines = idx + 1;
+        if idx < start_line {
+            continue;
+        }
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -145,6 +171,7 @@ pub fn extract_session_text(jsonl: &str, max_chars: usize) -> (String, SessionMe
         turn_count,
         truncated,
         raw_bytes: jsonl.len(),
+        total_lines,
     };
     (text, meta)
 }
@@ -196,7 +223,7 @@ mod tests {
                 "2026-08-07T00:00:01Z"
             ),
         );
-        let (text, meta) = extract_session_text(&jsonl, 100_000);
+        let (text, meta) = extract_session_text(&jsonl, 100_000, 0);
         assert_eq!(text, "USER: hello there\n\nASSISTANT: hi back");
         assert_eq!(meta.turn_count, 2);
         assert_eq!(meta.session_id.as_deref(), Some("sess-1"));
@@ -204,6 +231,77 @@ mod tests {
         assert_eq!(meta.first_ts.as_deref(), Some("2026-08-07T00:00:00Z"));
         assert_eq!(meta.last_ts.as_deref(), Some("2026-08-07T00:00:01Z"));
         assert!(!meta.truncated);
+        assert_eq!(meta.total_lines, 2);
+    }
+
+    // --- start_line (ADR-0006 Phase 2): incremental extraction ---
+
+    #[test]
+    fn start_line_zero_matches_the_original_whole_file_behavior() {
+        let jsonl = format!(
+            "{}\n{}\n",
+            text_line("user", "first turn", "sess-1", "/repo", "t1"),
+            text_line("assistant", "second turn", "sess-1", "/repo", "t2"),
+        );
+        let (text_default, meta_default) = extract_session_text(&jsonl, 100_000, 0);
+        let (text_explicit_zero, meta_explicit_zero) = extract_session_text(&jsonl, 100_000, 0);
+        assert_eq!(text_default, text_explicit_zero);
+        assert_eq!(meta_default, meta_explicit_zero);
+        assert_eq!(text_default, "USER: first turn\n\nASSISTANT: second turn");
+    }
+
+    #[test]
+    fn start_line_at_a_turn_boundary_extracts_only_later_turns() {
+        let jsonl = format!(
+            "{}\n{}\n",
+            text_line("user", "first turn", "sess-1", "/repo", "t1"),
+            text_line("assistant", "second turn", "sess-1", "/repo", "t2"),
+        );
+        // Line 0 is the first turn -- start_line: 1 skips it, keeping only
+        // the second.
+        let (text, meta) = extract_session_text(&jsonl, 100_000, 1);
+        assert_eq!(text, "ASSISTANT: second turn");
+        assert_eq!(meta.turn_count, 1);
+        // total_lines reflects the FULL input (2), not "lines processed
+        // after the skip" -- what an incremental caller needs to save as
+        // its next start_line.
+        assert_eq!(meta.total_lines, 2);
+    }
+
+    #[test]
+    fn start_line_past_total_lines_yields_empty_extraction_not_a_panic() {
+        let jsonl = format!(
+            "{}\n{}\n",
+            text_line("user", "first turn", "sess-1", "/repo", "t1"),
+            text_line("assistant", "second turn", "sess-1", "/repo", "t2"),
+        );
+        let (text, meta) = extract_session_text(&jsonl, 100_000, 5);
+        assert_eq!(text, "");
+        assert_eq!(meta.turn_count, 0);
+        // Still the real total, even though nothing was processed.
+        assert_eq!(meta.total_lines, 2);
+    }
+
+    #[test]
+    fn a_second_call_with_the_first_calls_total_lines_yields_only_new_content() {
+        // Simulates the real incremental pattern: call once, save
+        // total_lines, append new turns, call again with that saved
+        // value as start_line -- confirms the result is a strict suffix
+        // of what a whole-file call would have produced.
+        let first_turn = text_line("user", "first turn", "sess-1", "/repo", "t1");
+        let jsonl_v1 = format!("{first_turn}\n");
+        let (_, meta_v1) = extract_session_text(&jsonl_v1, 100_000, 0);
+        assert_eq!(meta_v1.total_lines, 1);
+
+        let second_turn = text_line("assistant", "second turn", "sess-1", "/repo", "t2");
+        let jsonl_v2 = format!("{first_turn}\n{second_turn}\n");
+        let (text_incremental, meta_v2) =
+            extract_session_text(&jsonl_v2, 100_000, meta_v1.total_lines);
+        assert_eq!(text_incremental, "ASSISTANT: second turn");
+        assert_eq!(meta_v2.total_lines, 2);
+
+        let (text_whole_file, _) = extract_session_text(&jsonl_v2, 100_000, 0);
+        assert!(text_whole_file.ends_with(&text_incremental));
     }
 
     #[test]
@@ -215,7 +313,7 @@ mod tests {
             "/repo",
             "2026-08-07T00:00:00Z",
         ) + "\n";
-        let (text, _) = extract_session_text(&jsonl, 100_000);
+        let (text, _) = extract_session_text(&jsonl, 100_000, 0);
         assert_eq!(text, "USER: real question");
     }
 
@@ -226,7 +324,7 @@ mod tests {
             + "\n"
             + r#"{"type":"user","sessionId":"s","cwd":"/r","timestamp":"t","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"output"}]}}"#
             + "\n";
-        let (text, meta) = extract_session_text(&jsonl, 100_000);
+        let (text, meta) = extract_session_text(&jsonl, 100_000, 0);
         assert_eq!(text, "");
         assert_eq!(meta.turn_count, 0);
     }
@@ -238,7 +336,7 @@ mod tests {
             text_line("user", "first", "s", "/r", "t1"),
             text_line("assistant", "second", "s", "/r", "t2"),
         );
-        let (text, meta) = extract_session_text(&jsonl, 100_000);
+        let (text, meta) = extract_session_text(&jsonl, 100_000, 0);
         assert_eq!(meta.turn_count, 2);
         assert!(text.contains("first") && text.contains("second"));
     }
@@ -246,7 +344,7 @@ mod tests {
     #[test]
     fn truncates_long_text_in_the_middle_and_flags_it() {
         let jsonl = text_line("user", &"word ".repeat(50), "s", "/r", "t") + "\n";
-        let (text, meta) = extract_session_text(&jsonl, 40);
+        let (text, meta) = extract_session_text(&jsonl, 40, 0);
         assert!(meta.truncated);
         assert!(text.contains("...[truncated — session exceeded per-item cap]..."));
     }
@@ -258,7 +356,7 @@ mod tests {
         // weren't char-safe.
         let content = "café ".repeat(30);
         let jsonl = text_line("user", &content, "s", "/r", "t") + "\n";
-        let (text, meta) = extract_session_text(&jsonl, 20);
+        let (text, meta) = extract_session_text(&jsonl, 20, 0);
         assert!(meta.truncated);
         // Must not panic, and must still be valid UTF-8 (guaranteed by
         // type, but assert content is non-empty and sane).
@@ -275,6 +373,7 @@ mod tests {
             turn_count: 3,
             truncated: false,
             raw_bytes: 100,
+            total_lines: 2,
         };
         let digest = build_digest_content("compressed body here", &meta);
         assert!(digest.starts_with("SESSION DIGEST sess-1\n\n---\n"));
@@ -286,7 +385,7 @@ mod tests {
 
     #[test]
     fn empty_transcript_produces_empty_text_and_zero_turns() {
-        let (text, meta) = extract_session_text("", 100_000);
+        let (text, meta) = extract_session_text("", 100_000, 0);
         assert_eq!(text, "");
         assert_eq!(meta.turn_count, 0);
         assert!(!meta.truncated);
