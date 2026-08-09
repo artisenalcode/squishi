@@ -56,6 +56,32 @@ const MIN_PUNCTUATION_PER_100_WORDS: f32 = 1.0;
 /// for embedding/dedup/shape-classification like real sentences are.
 const FALLBACK_WINDOW_WORDS: usize = 20;
 
+/// Sentences per `embed_batch` ONNX call. Bounds peak memory/compute per
+/// call rather than one unbounded batch for a document with tens of
+/// thousands of eligible sentences (real case found 2026-08-10: a
+/// multi-hour livestream transcript with ~500K words). 32 is a
+/// conventional sentence-transformer batch size, not independently
+/// tuned here.
+const EMBED_BATCH_SIZE: usize = 32;
+
+/// Cap on how many previously-kept embeddings a new sentence is compared
+/// against, in both the keep/drop loop and the extractive-summary
+/// centrality ranking. Without this, each is O(k) work per sentence over
+/// k already-kept sentences — O(n^2) total across a document, since k
+/// grows with n when duplication is low. Harmless at ordinary sizes
+/// (dozens/hundreds of sentences) but real at the ~500K-word transcript
+/// scale noted above: tens of thousands of kept sentences would mean
+/// hundreds of millions of 384-dim cosine-similarity calls. Bounding to
+/// the most recent/sampled MAX_COMPARISON_WINDOW trades exhaustive
+/// whole-document comparison for bounded compute — the same tradeoff
+/// log_compress.rs already makes with its first/last/top-N capping,
+/// rather than exhaustive processing of arbitrarily large input. True
+/// duplicates in transcripts are overwhelmingly local (a speaker
+/// repeating themselves within a session), so windowing by recency loses
+/// little in practice. Not independently tuned — a round number well
+/// above what any test or the original ~81K-word corpora need.
+const MAX_COMPARISON_WINDOW: usize = 500;
+
 fn is_effectively_unpunctuated(content: &str) -> bool {
     let word_count = content.split_whitespace().count();
     if word_count == 0 {
@@ -289,6 +315,24 @@ impl SemanticDedup {
         let sentences: Vec<&str> = split_sentences(text_for_split);
         let original_sentences = sentences.len();
 
+        // Batch-embed every eligible sentence up front, in chunks of
+        // EMBED_BATCH_SIZE -- one ONNX forward pass per chunk instead of
+        // one per sentence (see EMBED_BATCH_SIZE's doc comment for why).
+        // Embedding is independent per sentence; only the greedy
+        // keep/drop decision below is sequential, so precomputing these
+        // doesn't change that loop's semantics or output, only how the
+        // embeddings were produced.
+        let eligible_texts: Vec<&str> = sentences
+            .iter()
+            .filter(|s| (MIN_WORDS..=MAX_WORDS).contains(&s.split_whitespace().count()))
+            .copied()
+            .collect();
+        let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(eligible_texts.len());
+        for chunk in eligible_texts.chunks(EMBED_BATCH_SIZE) {
+            embeddings.extend(self.embed_batch(chunk)?);
+        }
+        let mut embeddings = embeddings.into_iter();
+
         let mut kept: Vec<KeptSentence> = Vec::new();
         let mut drops: Vec<Drop> = Vec::new();
         // Parallel to kept_embeddings: which `sentences` index (and thus
@@ -307,11 +351,11 @@ impl SemanticDedup {
                 continue;
             }
 
-            let embedding = self.embed(sentence)?;
-            let best_match = kept_embeddings
-                .iter()
-                .map(|(kept_index, k)| (*kept_index, cosine_similarity(&embedding, k)))
-                .max_by(|a, b| a.1.total_cmp(&b.1));
+            let embedding = embeddings.next().ok_or_else(|| {
+                "embed_batch returned fewer embeddings than eligible sentences (internal bug)"
+                    .to_string()
+            })?;
+            let best_match = best_match(&embedding, &kept_embeddings);
 
             match best_match {
                 Some((kept_index, similarity)) if similarity >= threshold => {
@@ -365,27 +409,58 @@ impl SemanticDedup {
         self.punctuation_restorer.as_mut()
     }
 
-    fn embed(&mut self, text: &str) -> Result<Vec<f32>, String> {
-        let encoding = self
+    /// Embeds a batch of sentences in one ONNX forward pass, replacing
+    /// the original one-sentence-at-a-time `embed()` (removed 2026-08-10:
+    /// no longer had any callers once `dedupe()` switched to this).
+    /// Real fix, not a hypothetical optimization -- found reingesting a
+    /// channel with several multi-hour livestream transcripts (tens of
+    /// thousands of sentences each), where one full transformer forward
+    /// pass per sentence turned a single document's dedup into tens of
+    /// minutes of unbatched CPU inference. The ONNX contract already
+    /// supports a batch dimension (`[batch, seq]` in, `[batch, seq, 384]`
+    /// out -- see this module's own doc comment) -- this was purely a
+    /// missed optimization at the call site, not a model limitation.
+    /// Returns embeddings in the same order as `texts`.
+    ///
+    /// Uses the tokenizer's own batch padding (`with_padding`, default
+    /// `BatchLongest`/right-padded/`pad_id: 0`) so every sequence in the
+    /// batch shares one seq_len, which ONNX's fixed-shape `[batch, seq]`
+    /// tensors require. Padding is toggled back off afterward so the
+    /// `Tokenizer`'s state doesn't leak into any other caller that
+    /// expects unpadded single-sequence encoding.
+    fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.tokenizer
+            .with_padding(Some(tokenizers::PaddingParams::default()));
+        let encode_result = self
             .tokenizer
-            .encode(text, true)
-            .map_err(|e| e.to_string())?;
+            .encode_batch(texts.to_vec(), true)
+            .map_err(|e| e.to_string());
+        self.tokenizer.with_padding(None);
+        let encodings = encode_result?;
 
-        let ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
-        let mask: Vec<i64> = encoding
-            .get_attention_mask()
-            .iter()
-            .map(|&m| m as i64)
-            .collect();
-        let type_ids: Vec<i64> = encoding.get_type_ids().iter().map(|&t| t as i64).collect();
-        let seq_len = ids.len();
+        let batch_size = encodings.len();
+        let seq_len = encodings[0].get_ids().len();
 
-        let input_ids = TensorRef::from_array_view(([1, seq_len], ids.as_slice()))
+        let mut ids = Vec::with_capacity(batch_size * seq_len);
+        let mut mask = Vec::with_capacity(batch_size * seq_len);
+        let mut type_ids = Vec::with_capacity(batch_size * seq_len);
+        for e in &encodings {
+            ids.extend(e.get_ids().iter().map(|&id| id as i64));
+            mask.extend(e.get_attention_mask().iter().map(|&m| m as i64));
+            type_ids.extend(e.get_type_ids().iter().map(|&t| t as i64));
+        }
+
+        let input_ids = TensorRef::from_array_view(([batch_size, seq_len], ids.as_slice()))
             .map_err(|e| e.to_string())?;
-        let attention_mask = TensorRef::from_array_view(([1, seq_len], mask.as_slice()))
+        let attention_mask = TensorRef::from_array_view(([batch_size, seq_len], mask.as_slice()))
             .map_err(|e| e.to_string())?;
-        let token_type_ids = TensorRef::from_array_view(([1, seq_len], type_ids.as_slice()))
-            .map_err(|e| e.to_string())?;
+        let token_type_ids =
+            TensorRef::from_array_view(([batch_size, seq_len], type_ids.as_slice()))
+                .map_err(|e| e.to_string())?;
 
         let outputs = self
             .session
@@ -400,35 +475,36 @@ impl SemanticDedup {
             .try_extract_tensor::<f32>()
             .map_err(|e| e.to_string())?;
 
-        // Mean-pool over the sequence dimension, masking out padding —
-        // the standard sentence-transformers pooling recipe. hidden is
-        // flat [seq_len * EMBEDDING_DIM]; mask[i] gates token i.
-        let mut pooled = vec![0f32; EMBEDDING_DIM];
-        let mut mask_sum = 0f32;
-        for (i, &m) in mask.iter().enumerate() {
-            if m == 0 {
-                continue;
+        let mut result = Vec::with_capacity(batch_size);
+        for b in 0..batch_size {
+            let mut pooled = vec![0f32; EMBEDDING_DIM];
+            let mut mask_sum = 0f32;
+            for s in 0..seq_len {
+                if mask[b * seq_len + s] == 0 {
+                    continue;
+                }
+                mask_sum += 1.0;
+                let base = (b * seq_len + s) * EMBEDDING_DIM;
+                for d in 0..EMBEDDING_DIM {
+                    pooled[d] += hidden[base + d];
+                }
             }
-            mask_sum += 1.0;
-            for d in 0..EMBEDDING_DIM {
-                pooled[d] += hidden[i * EMBEDDING_DIM + d];
+            if mask_sum > 0.0 {
+                for v in &mut pooled {
+                    *v /= mask_sum;
+                }
             }
-        }
-        if mask_sum > 0.0 {
-            for v in &mut pooled {
-                *v /= mask_sum;
+
+            let norm: f32 = pooled.iter().map(|v| v * v).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                for v in &mut pooled {
+                    *v /= norm;
+                }
             }
+            result.push(pooled);
         }
 
-        // L2-normalize, matching dedupe_semantic.py's embed().
-        let norm: f32 = pooled.iter().map(|v| v * v).sum::<f32>().sqrt();
-        if norm > 0.0 {
-            for v in &mut pooled {
-                *v /= norm;
-            }
-        }
-
-        Ok(pooled)
+        Ok(result)
     }
 }
 
@@ -452,16 +528,26 @@ const SUMMARY_MAX: usize = 10;
 /// pass. Deliberately non-LLM: this is a ranking of what's already
 /// there, not synthesis — see semantic_dedup.rs's module doc for the
 /// boundary this keeps with actual summarization.
+///
+/// "Every other" is capped at MAX_COMPARISON_WINDOW landmarks (a fixed
+/// stride through `kept_embeddings`, same landmarks for every sentence)
+/// rather than a true all-pairs mean — see that constant's doc comment.
+/// Below the cap (`stride == 1`) this is exactly the original all-pairs
+/// computation; only documents with more kept sentences than the window
+/// get the approximation.
 fn extractive_summary(kept: &[KeptSentence], kept_embeddings: &[(usize, Vec<f32>)]) -> Vec<String> {
     if kept_embeddings.len() < MIN_SENTENCES_FOR_SUMMARY {
         return Vec::new();
     }
+
+    let stride = kept_embeddings.len().div_ceil(MAX_COMPARISON_WINDOW).max(1);
 
     let mut scored: Vec<(usize, f32)> = kept_embeddings
         .iter()
         .map(|(index, emb)| {
             let others: Vec<&Vec<f32>> = kept_embeddings
                 .iter()
+                .step_by(stride)
                 .filter(|(i, _)| i != index)
                 .map(|(_, e)| e)
                 .collect();
@@ -490,6 +576,18 @@ fn extractive_summary(kept: &[KeptSentence], kept_embeddings: &[(usize, Vec<f32>
         .into_iter()
         .filter_map(|i| kept.iter().find(|k| k.index == i).map(|k| k.text.clone()))
         .collect()
+}
+
+/// Finds the most-similar already-kept embedding to `embedding`, searching
+/// only the most recent `MAX_COMPARISON_WINDOW` of `kept_embeddings` (see
+/// that constant's doc comment for why). Pure/standalone so it's testable
+/// with synthetic vectors, without a real model.
+fn best_match(embedding: &[f32], kept_embeddings: &[(usize, Vec<f32>)]) -> Option<(usize, f32)> {
+    let window_start = kept_embeddings.len().saturating_sub(MAX_COMPARISON_WINDOW);
+    kept_embeddings[window_start..]
+        .iter()
+        .map(|(kept_index, k)| (*kept_index, cosine_similarity(embedding, k)))
+        .max_by(|a, b| a.1.total_cmp(&b.1))
 }
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
@@ -741,5 +839,67 @@ mod tests {
         // Still returned in original document order (0, 1, 2), not
         // similarity-rank order.
         assert_eq!(summary, vec!["cluster A", "cluster B", "cluster C"]);
+    }
+
+    #[test]
+    fn best_match_ignores_duplicates_outside_the_comparison_window() {
+        // A true duplicate of `query` at index 0, followed by exactly
+        // MAX_COMPARISON_WINDOW filler entries orthogonal to `query`
+        // (third component always 0, so cosine similarity to `query` is
+        // always exactly 0, regardless of the filler's other two
+        // components). Once the filler pushes index 0 outside the
+        // window, `best_match` must not find it.
+        let query = unit_vec(vec![1.0, 0.0, 0.0]);
+        let mut kept_embeddings: Vec<(usize, Vec<f32>)> = vec![(0, query.clone())];
+        for i in 1..=MAX_COMPARISON_WINDOW {
+            let angle = i as f32;
+            kept_embeddings.push((i, unit_vec(vec![0.0, angle.sin(), angle.cos()])));
+        }
+        let (best_index, similarity) = best_match(&query, &kept_embeddings).unwrap();
+        assert_ne!(
+            best_index, 0,
+            "the true duplicate at index 0 is outside the window"
+        );
+        assert!(similarity.abs() < 1e-6);
+    }
+
+    #[test]
+    fn best_match_finds_duplicate_inside_the_comparison_window() {
+        let query = unit_vec(vec![1.0, 0.0]);
+        let mut kept_embeddings: Vec<(usize, Vec<f32>)> = (0..MAX_COMPARISON_WINDOW - 1)
+            .map(|i| (i, unit_vec(vec![0.0, 1.0])))
+            .collect();
+        let dup_index = kept_embeddings.len();
+        kept_embeddings.push((dup_index, query.clone()));
+
+        let (best_index, similarity) = best_match(&query, &kept_embeddings).unwrap();
+        assert_eq!(best_index, dup_index);
+        assert!(similarity > 0.999);
+    }
+
+    #[test]
+    fn summary_handles_more_kept_sentences_than_the_comparison_window() {
+        // Regression guard for the O(k^2) fix: this many kept sentences
+        // used to mean MAX_COMPARISON_WINDOW^2-scale pairwise work in
+        // `extractive_summary`; it must still complete and produce a
+        // valid, bounded summary rather than hang or panic.
+        let n = MAX_COMPARISON_WINDOW * 2 + 3;
+        let kept: Vec<KeptSentence> = (0..n)
+            .map(|i| KeptSentence {
+                text: format!("sentence {i}"),
+                index: i,
+                shape: SentenceShape::Concept,
+            })
+            .collect();
+        let embeddings: Vec<(usize, Vec<f32>)> = (0..n)
+            .map(|i| {
+                let angle = i as f32 * 0.001;
+                (i, unit_vec(vec![angle.cos(), angle.sin()]))
+            })
+            .collect();
+
+        let summary = extractive_summary(&kept, &embeddings);
+        assert!(!summary.is_empty());
+        assert!(summary.len() <= SUMMARY_MAX);
     }
 }
