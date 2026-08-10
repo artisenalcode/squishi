@@ -211,6 +211,14 @@ pub struct KeptSentence {
     /// traceability anchor back to the source document.
     pub index: usize,
     pub shape: SentenceShape,
+    /// The embedding already computed for this sentence during dedup,
+    /// carried forward rather than discarded -- a caller doing further
+    /// embedding-based work downstream (e.g. cross-document clustering)
+    /// can reuse this instead of re-embedding the same text a second
+    /// time. `None` for a sentence outside `MIN_WORDS..MAX_WORDS`
+    /// (kept unconditionally, never embedded at all -- see the
+    /// `dedupe()` loop below).
+    pub embedding: Option<Vec<f32>>,
 }
 
 /// A sentence collapsed into an existing kept sentence as a paraphrase —
@@ -347,6 +355,7 @@ impl SemanticDedup {
                     text: sentence.to_string(),
                     index,
                     shape: classify_shape(sentence),
+                    embedding: None,
                 });
                 continue;
             }
@@ -370,6 +379,7 @@ impl SemanticDedup {
                         text: sentence.to_string(),
                         index,
                         shape: classify_shape(sentence),
+                        embedding: Some(embedding.clone()),
                     });
                     kept_embeddings.push((index, embedding));
                 }
@@ -671,6 +681,40 @@ mod tests {
 
     #[test]
     #[ignore]
+    fn kept_sentences_carry_their_already_computed_embedding_forward() {
+        let mut d = SemanticDedup::load().unwrap();
+        let content = "The database connection failed after three consecutive retry attempts. \
+                        Quarterly revenue grew by twelve percent compared to last year. \
+                        Yes.";
+        let result = d.dedupe(content, 0.80, true).unwrap();
+        assert_eq!(result.kept_sentences, 3);
+
+        // The two real (within MIN_WORDS..MAX_WORDS) sentences were
+        // embedded during dedup -- that embedding should be carried
+        // forward on KeptSentence, not discarded, so a downstream
+        // caller never has to re-embed the same text.
+        let real_sentences: Vec<_> = result
+            .kept
+            .iter()
+            .filter(|k| k.text.starts_with("The database") || k.text.starts_with("Quarterly"))
+            .collect();
+        assert_eq!(real_sentences.len(), 2);
+        for k in &real_sentences {
+            let embedding = k
+                .embedding
+                .as_ref()
+                .unwrap_or_else(|| panic!("expected Some(embedding) for {:?}", k.text));
+            assert_eq!(embedding.len(), 384, "all-MiniLM-L6-v2's real dimension");
+        }
+
+        // "Yes." is under MIN_WORDS -- kept unconditionally, never
+        // embedded at all.
+        let short = result.kept.iter().find(|k| k.text == "Yes.").unwrap();
+        assert!(short.embedding.is_none());
+    }
+
+    #[test]
+    #[ignore]
     fn allow_punctuation_restore_false_blocks_restoration_even_on_unpunctuated_text() {
         let mut d = SemanticDedup::load().unwrap();
         // Real shape: unpunctuated (would trigger restoration if
@@ -786,11 +830,13 @@ mod tests {
                 text: "a".into(),
                 index: 0,
                 shape: SentenceShape::Concept,
+                embedding: None,
             },
             KeptSentence {
                 text: "b".into(),
                 index: 1,
                 shape: SentenceShape::Concept,
+                embedding: None,
             },
         ];
         let embeddings = vec![(0, unit_vec(vec![1.0, 0.0])), (1, unit_vec(vec![0.0, 1.0]))];
@@ -808,21 +854,25 @@ mod tests {
                 text: "cluster A".into(),
                 index: 0,
                 shape: SentenceShape::Concept,
+                embedding: None,
             },
             KeptSentence {
                 text: "cluster B".into(),
                 index: 1,
                 shape: SentenceShape::Concept,
+                embedding: None,
             },
             KeptSentence {
                 text: "cluster C".into(),
                 index: 2,
                 shape: SentenceShape::Concept,
+                embedding: None,
             },
             KeptSentence {
                 text: "outlier".into(),
                 index: 3,
                 shape: SentenceShape::Concept,
+                embedding: None,
             },
         ];
         let embeddings = vec![
@@ -889,6 +939,7 @@ mod tests {
                 text: format!("sentence {i}"),
                 index: i,
                 shape: SentenceShape::Concept,
+                embedding: None,
             })
             .collect();
         let embeddings: Vec<(usize, Vec<f32>)> = (0..n)

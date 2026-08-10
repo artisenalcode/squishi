@@ -175,6 +175,7 @@ fn route_with_override(text: &str, forced_kind: Option<ContentKind>) -> (Content
         forced_kind,
         &mut dedup_cache,
         ALLOW_PUNCTUATION_RESTORE_DEFAULT,
+        false,
     )
 }
 
@@ -199,6 +200,7 @@ fn route_impl(
     forced_kind: Option<ContentKind>,
     dedup_cache: &mut Option<SemanticDedup>,
     allow_punctuation_restore: bool,
+    include_embedding: bool,
 ) -> (ContentKind, Output) {
     // Unconditional pre-pass, not a ContentKind of its own — a base64 blob
     // (an embedded screenshot, a data-URI) can appear inside any shape
@@ -335,6 +337,17 @@ fn route_impl(
                                         SentenceShape::Concept => "concept",
                                     }),
                                 );
+                                if include_embedding && let Some(embedding) = &k.embedding {
+                                    m.insert(
+                                        "embedding".to_string(),
+                                        Value::from(
+                                            embedding
+                                                .iter()
+                                                .map(|f| Value::from(*f))
+                                                .collect::<Vec<_>>(),
+                                        ),
+                                    );
+                                }
                                 Value::Object(m)
                             })
                             .collect();
@@ -425,18 +438,24 @@ fn build_output(text: &str, kind: &ContentKind, output: Output) -> Map<String, V
 }
 
 /// Parses `--batch`'s stdin contract: a JSON array of `{"id", "text",
-/// "restore_punctuation"}` objects, returned as `(id, text,
-/// allow_punctuation_restore)` triples in the original order.
-/// `restore_punctuation` is optional per item, defaulting to `true`
-/// (matches this flag's own pre-existing default, no behavior change
-/// for callers that don't set it) — a caller that knows a source never
-/// needs it (Wikipedia, git commit messages — already have real
-/// punctuation) sets it `false` explicitly rather than relying solely
-/// on the content-density heuristic. Hand-parsed against
-/// `serde_json::Value` rather than a `#[derive(Deserialize)]` struct —
-/// same reasoning `build_output` already gives for not pulling in a
-/// derive dependency for a secondary, opt-in path.
-fn parse_batch_items(raw: &str) -> Result<Vec<(String, String, bool)>, String> {
+/// "restore_punctuation", "include_embedding"}` objects, returned as
+/// `(id, text, allow_punctuation_restore, include_embedding)` tuples in
+/// the original order. `restore_punctuation` is optional per item,
+/// defaulting to `true` (matches this flag's own pre-existing default,
+/// no behavior change for callers that don't set it) — a caller that
+/// knows a source never needs it (Wikipedia, git commit messages —
+/// already have real punctuation) sets it `false` explicitly rather
+/// than relying solely on the content-density heuristic.
+/// `include_embedding` is optional, defaulting to `false` — opt-in, so
+/// every existing caller's output stays exactly as lean as before;
+/// only a caller that actually wants each kept sentence's already-
+/// computed embedding (to reuse for its own downstream embedding-based
+/// work, instead of re-embedding the same text a second time) pays for
+/// the larger response. Hand-parsed against `serde_json::Value` rather
+/// than a `#[derive(Deserialize)]` struct — same reasoning
+/// `build_output` already gives for not pulling in a derive dependency
+/// for a secondary, opt-in path.
+fn parse_batch_items(raw: &str) -> Result<Vec<(String, String, bool, bool)>, String> {
     let value: Value =
         serde_json::from_str(raw).map_err(|e| format!("--batch stdin must be valid JSON: {e}"))?;
     let array = value
@@ -461,7 +480,11 @@ fn parse_batch_items(raw: &str) -> Result<Vec<(String, String, bool)>, String> {
                 .get("restore_punctuation")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(ALLOW_PUNCTUATION_RESTORE_DEFAULT);
-            Ok((id, text, allow_punctuation_restore))
+            let include_embedding = item
+                .get("include_embedding")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            Ok((id, text, allow_punctuation_restore, include_embedding))
         })
         .collect()
 }
@@ -652,12 +675,13 @@ fn main() {
 
         let mut dedup_cache = None;
         let mut results = Vec::with_capacity(items.len());
-        for (id, item_text, allow_punctuation_restore) in items {
+        for (id, item_text, allow_punctuation_restore, include_embedding) in items {
             let (kind, output) = route_impl(
                 &item_text,
                 forced.clone(),
                 &mut dedup_cache,
                 allow_punctuation_restore,
+                include_embedding,
             );
             let mut json = build_output(&item_text, &kind, output);
             json.insert("id".to_string(), Value::from(id));
@@ -694,12 +718,13 @@ mod tests {
     fn parse_batch_items_parses_a_real_array() {
         let raw = r#"[{"id": "a", "text": "first"}, {"id": "b", "text": "second"}]"#;
         let items = parse_batch_items(raw).unwrap();
-        // Neither item set restore_punctuation -- both default to true.
+        // Neither item set restore_punctuation or include_embedding --
+        // both default to (true, false).
         assert_eq!(
             items,
             vec![
-                ("a".to_string(), "first".to_string(), true),
-                ("b".to_string(), "second".to_string(), true)
+                ("a".to_string(), "first".to_string(), true, false),
+                ("b".to_string(), "second".to_string(), true, false)
             ]
         );
     }
@@ -716,7 +741,8 @@ mod tests {
             (
                 "yt-video".to_string(),
                 "unpunctuated caption text".to_string(),
-                true
+                true,
+                false
             )
         );
         assert_eq!(
@@ -724,8 +750,19 @@ mod tests {
             (
                 "wikipedia-page".to_string(),
                 "Real prose.".to_string(),
+                false,
                 false
             )
+        );
+    }
+
+    #[test]
+    fn parse_batch_items_honors_an_explicit_include_embedding_true() {
+        let raw = r#"[{"id": "a", "text": "some text", "include_embedding": true}]"#;
+        let items = parse_batch_items(raw).unwrap();
+        assert_eq!(
+            items[0],
+            ("a".to_string(), "some text".to_string(), true, true)
         );
     }
 

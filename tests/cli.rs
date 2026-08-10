@@ -252,6 +252,64 @@ fn json_semantic_dedup_exposes_full_kept_array_with_index_and_shape() {
 }
 
 #[test]
+#[ignore] // real model load (network/cache) — proves include_embedding is opt-in per item, both directions
+fn batch_mode_include_embedding_is_opt_in_per_item() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_squishi"))
+        .args(["--batch", "--force-kind", "plain-text"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn squishi binary");
+
+    let sentence = "The database connection failed after three consecutive retry attempts today. ";
+    let long_text: String = std::iter::repeat_n(sentence, 30).collect();
+    let batch_input = serde_json::json!([
+        {"id": "with-embedding", "text": long_text, "include_embedding": true},
+        {"id": "without-embedding", "text": long_text}
+    ]);
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(batch_input.to_string().as_bytes())
+        .expect("failed to write to stdin");
+
+    let output = child.wait_with_output().expect("failed to wait on child");
+    assert!(
+        output.status.success(),
+        "squishi --batch exited non-zero: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim())
+            .expect("stdout should be a valid JSON array");
+
+    let with_embedding = value[0]["kept"]
+        .as_array()
+        .expect("kept should be an array");
+    assert!(
+        with_embedding.iter().any(|k| k.get("embedding").is_some()),
+        "at least one kept sentence should carry an embedding when include_embedding is true: {with_embedding:?}"
+    );
+    let embedding_len = with_embedding
+        .iter()
+        .find_map(|k| k.get("embedding").and_then(|e| e.as_array()))
+        .expect("at least one kept sentence should have an embedding array")
+        .len();
+    assert_eq!(embedding_len, 384, "all-MiniLM-L6-v2's real dimension");
+
+    let without_embedding = value[1]["kept"]
+        .as_array()
+        .expect("kept should be an array");
+    assert!(
+        without_embedding
+            .iter()
+            .all(|k| k.get("embedding").is_none()),
+        "no kept sentence should carry an embedding when include_embedding is omitted: {without_embedding:?}"
+    );
+}
+
+#[test]
 fn batch_mode_rejects_malformed_stdin_with_a_clear_error() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_squishi"))
         .arg("--batch")
