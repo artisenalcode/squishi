@@ -321,6 +321,23 @@ fn route_impl(
                             .filter(|k| k.shape == SentenceShape::Narrative)
                             .map(|k| Value::from(k.text.clone()))
                             .collect();
+                        let kept: Vec<Value> = result
+                            .kept
+                            .iter()
+                            .map(|k| {
+                                let mut m = Map::new();
+                                m.insert("index".to_string(), Value::from(k.index));
+                                m.insert("text".to_string(), Value::from(k.text.clone()));
+                                m.insert(
+                                    "shape".to_string(),
+                                    Value::from(match k.shape {
+                                        SentenceShape::Narrative => "narrative",
+                                        SentenceShape::Concept => "concept",
+                                    }),
+                                );
+                                Value::Object(m)
+                            })
+                            .collect();
                         let traceability: Vec<Value> = result
                             .drops
                             .iter()
@@ -344,6 +361,7 @@ fn route_impl(
                                 ),
                                 ("summary".to_string(), Value::from(result.summary)),
                                 ("stories".to_string(), Value::from(stories)),
+                                ("kept".to_string(), Value::from(kept)),
                                 ("drops".to_string(), Value::from(traceability)),
                                 (
                                     "punctuation_restored".to_string(),

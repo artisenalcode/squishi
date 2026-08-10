@@ -226,6 +226,32 @@ fn batch_mode_restore_punctuation_false_blocks_restoration_on_real_unpunctuated_
 }
 
 #[test]
+#[ignore] // real model load (network/cache) — proves the `kept` array exposes every survivor, not just narrative-shaped ones
+fn json_semantic_dedup_exposes_full_kept_array_with_index_and_shape() {
+    let sentence = "hello and welcome to this transcript we are going to talk about many things today including neuroscience and psychology and how the brain actually works when it comes to emotion. ";
+    let long_text: String = std::iter::repeat_n(sentence, 20).collect();
+    let value = run(&long_text);
+
+    let kept = value["kept"]
+        .as_array()
+        .expect("kept should be a JSON array");
+    let after = value["sentences_after"]
+        .as_u64()
+        .expect("sentences_after should be present") as usize;
+    assert_eq!(
+        kept.len(),
+        after,
+        "kept array length should match sentences_after — it must include every survivor, not just narrative-shaped ones"
+    );
+    for entry in kept {
+        assert!(entry["index"].is_u64());
+        assert!(entry["text"].is_string());
+        let shape = entry["shape"].as_str().expect("shape should be a string");
+        assert!(shape == "narrative" || shape == "concept");
+    }
+}
+
+#[test]
 fn batch_mode_rejects_malformed_stdin_with_a_clear_error() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_squishi"))
         .arg("--batch")
