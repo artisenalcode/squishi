@@ -296,6 +296,60 @@ never calls `trm` or anything storage-shaped — `total-recall`'s own
 result, keeping the actual `stage` call in the tool that already owns
 storage.
 
+## `--level` — how hard each compressor pushes
+
+`conservative` / `default` / `aggressive` tune every threshold that used
+to be a fixed constant: `semantic_dedup`'s paraphrase-similarity cutoff,
+`diff_compress`'s context/hunk/file caps, `log_compress`'s error/warning/
+context/total-line caps, and `json_compress`'s keep-edge cap. `default`
+reproduces this repo's pre-`--level` behavior exactly — same numbers as
+always, byte-for-byte.
+
+```
+squishi --level aggressive <text>
+squishi --level conservative --json <text>
+```
+
+Values picked from real before/after measurement on real fixtures, not
+guessed — same standard as `diff_compress`'s own numbers above:
+
+| Surface | Conservative | Default | Aggressive | Fixture |
+|---|---|---|---|---|
+| `diff_compress` | 215,374 → 202,805 chars (5.8%) | → 135,729 (37.0%) | → 69,411 (67.8%) | real headroom commit (`eaf5980b`, 215KB) |
+| `log_compress` | 607,751 → 24,375 chars (96.0%) | → 7,495 (98.8%) | → 2,346 (99.6%) | real system journal, error/warning lines |
+| `json_compress` | 138,204 → 5,523 chars (96.0%) | → 2,787 (98.0%) | → 1,169 (99.2%) | real 400-element JSON array (graphify's own graph.json nodes) |
+| `semantic_dedup` | 181,315 → 181,082 chars (0.1%) | → 180,036 (0.7%) | → 176,836 (2.5%) | real YouTube auto-caption transcript, 181KB |
+
+`semantic_dedup`'s savings stay modest at every level on well-formed
+prose — expected, not a bug: it only drops genuinely near-duplicate
+sentences, and curated/edited text has little of that to begin with. The
+gain shows up on repetitive raw material (auto-captions, meeting
+transcripts), which is exactly what the fixture above is.
+
+## `--session-stats` — cumulative real savings across a session
+
+Scans a Claude Code session transcript (JSONL) for every squishi
+`--json` call it contains and reports real cumulative `chars_before`/
+`chars_after`, broken down by content `kind` and as a grand total.
+Read-only, never mutates the transcript.
+
+```
+squishi --session-stats <transcript.jsonl>
+squishi --session-stats <transcript.jsonl> --json
+```
+
+Matches `ToolResultItem.content` (from `session_prune`'s own transcript
+parser) against squishi's own five-key `--json` contract
+(`compressed`/`kind`/`source`/`chars_before`/`chars_after`) rather than
+identifying squishi calls by tool name or command text — `ToolUseItem
+.path` only captures Read/Write/Edit's `input.file_path`, not a Bash
+command, so name/command matching isn't reliable. This means it's
+invocation-method-agnostic (works whether squishi ran via Bash, a
+wrapper, anything), but also means a transcript with **zero** matching
+entries is reported honestly as zero calls, not an error — most
+transcripts squishi doesn't actively instrument will look like that, and
+that's the correct answer, not a false negative.
+
 ## Development
 
 ```bash

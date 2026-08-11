@@ -4,13 +4,14 @@ use squishi::base64_strip::strip_base64_blobs;
 use squishi::content_detect::{ContentKind, detect};
 use squishi::diff_compress::{DiffCompressConfig, compress_diff};
 use squishi::doctor;
-use squishi::json_compress::compress_json_array;
+use squishi::json_compress::{JsonCompressConfig, compress_json_array};
 use squishi::line_dedup::dedupe_line_runs;
 use squishi::log_compress::{LogCompressConfig, compress_log};
 use squishi::search_compress::compress_search_results;
 use squishi::semantic_dedup::{SemanticDedup, SentenceShape};
 use squishi::session_digest;
 use squishi::session_prune;
+use squishi::session_stats;
 
 #[derive(Parser)]
 #[command(
@@ -82,6 +83,14 @@ struct Cli {
     #[arg(long, value_name = "TRANSCRIPT_PATH")]
     session_digest: Option<std::path::PathBuf>,
 
+    /// Report cumulative real savings (chars_before/chars_after, per
+    /// content kind and total) from every squishi `--json` call found in
+    /// a Claude Code session transcript (JSONL) — instead of compressing
+    /// `text` (ignored when set). Same "flag not subcommand" reasoning as
+    /// `--doctor`. Read-only: never mutates the transcript.
+    #[arg(long, value_name = "TRANSCRIPT_PATH")]
+    session_stats: Option<std::path::PathBuf>,
+
     /// With --session-digest, the extracted-text truncation cap (middle
     /// dropped, head+tail kept), matching session_to_trm.py's default.
     #[arg(long, default_value_t = 100_000)]
@@ -120,12 +129,88 @@ struct Cli {
     /// there's no bare-text form for multiple outputs.
     #[arg(long)]
     batch: bool,
+
+    /// How hard each compressor pushes: `conservative` keeps more context
+    /// (safer, smaller savings), `aggressive` cuts harder (bigger savings,
+    /// more loss). Tunes json_compress's keep_edge, diff_compress's
+    /// context/hunk/file caps, log_compress's error/warning/context/
+    /// total-line caps, and semantic-dedup's paraphrase-similarity cutoff
+    /// — every threshold that was previously a fixed constant. Applies to
+    /// the default compression path and `--batch`; not read by
+    /// `--session-prune`/`--session-digest` (out of scope for this flag).
+    #[arg(long, value_enum, default_value_t = Level::Default)]
+    level: Level,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy)]
 #[value(rename_all = "kebab-case")]
 enum ForceKind {
     PlainText,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+#[value(rename_all = "kebab-case")]
+enum Level {
+    Conservative,
+    Default,
+    Aggressive,
+}
+
+/// Resolved per-level thresholds for every tunable compressor surface.
+/// Constructed once per `route_impl` call rather than threading four
+/// separate params — `--level` is a single caller-facing knob, this is
+/// its one expansion point.
+struct LevelConfigs {
+    paraphrase_threshold: f32,
+    diff: DiffCompressConfig,
+    log: LogCompressConfig,
+    json: JsonCompressConfig,
+}
+
+/// Real values chosen after measuring each level on real fixtures (see
+/// README's `--level` section for the measured before/after table) — not
+/// guessed. `Default` reproduces this repo's pre-`--level` fixed
+/// constants exactly, so `--level default` (the default) is a byte-for-
+/// byte no-op versus every pre-existing test and caller.
+fn configs_for_level(level: Level) -> LevelConfigs {
+    match level {
+        Level::Conservative => LevelConfigs {
+            paraphrase_threshold: 0.90,
+            diff: DiffCompressConfig {
+                max_context_lines: 4,
+                max_hunks_per_file: 20,
+                max_files: 40,
+            },
+            log: LogCompressConfig {
+                max_errors: 20,
+                max_warnings: 10,
+                context_lines: 4,
+                max_total_lines: 200,
+            },
+            json: JsonCompressConfig { keep_edge: 10 },
+        },
+        Level::Default => LevelConfigs {
+            paraphrase_threshold: PARAPHRASE_THRESHOLD,
+            diff: DiffCompressConfig::default(),
+            log: LogCompressConfig::default(),
+            json: JsonCompressConfig::default(),
+        },
+        Level::Aggressive => LevelConfigs {
+            paraphrase_threshold: 0.70,
+            diff: DiffCompressConfig {
+                max_context_lines: 1,
+                max_hunks_per_file: 5,
+                max_files: 10,
+            },
+            log: LogCompressConfig {
+                max_errors: 5,
+                max_warnings: 2,
+                context_lines: 1,
+                max_total_lines: 50,
+            },
+            json: JsonCompressConfig { keep_edge: 2 },
+        },
+    }
 }
 
 const SKIP_LOG_COMPRESS_UNDER_CHARS: usize = 2000;
@@ -152,6 +237,28 @@ fn route(text: &str) -> (ContentKind, Output) {
     route_with_override(text, None)
 }
 
+/// Like `route_with_override`, but with an explicit `--level` rather than
+/// the implicit `Level::Default` `route_with_override` always uses. The
+/// CLI's default (non-`--batch`) path uses this so `--level` actually
+/// reaches single-shot invocations; `route`/`route_with_override` stay
+/// level-less for existing callers (tests, `--session-digest`) that have
+/// no `--level` concept.
+fn route_with_level(
+    text: &str,
+    forced_kind: Option<ContentKind>,
+    level: Level,
+) -> (ContentKind, Output) {
+    let mut dedup_cache = None;
+    route_impl(
+        text,
+        forced_kind,
+        &mut dedup_cache,
+        ALLOW_PUNCTUATION_RESTORE_DEFAULT,
+        false,
+        level,
+    )
+}
+
 /// Same eligibility gate `SemanticDedup::dedupe` takes — see its own
 /// doc comment. Threaded down from `--batch`'s per-item field (default
 /// `true`, matching the pre-existing behavior this flag was added
@@ -176,6 +283,7 @@ fn route_with_override(text: &str, forced_kind: Option<ContentKind>) -> (Content
         &mut dedup_cache,
         ALLOW_PUNCTUATION_RESTORE_DEFAULT,
         false,
+        Level::Default,
     )
 }
 
@@ -201,6 +309,7 @@ fn route_impl(
     dedup_cache: &mut Option<SemanticDedup>,
     allow_punctuation_restore: bool,
     include_embedding: bool,
+    level: Level,
 ) -> (ContentKind, Output) {
     // Unconditional pre-pass, not a ContentKind of its own — a base64 blob
     // (an embedded screenshot, a data-URI) can appear inside any shape
@@ -211,9 +320,10 @@ fn route_impl(
     let text = text.as_str();
 
     let kind = forced_kind.unwrap_or_else(|| detect(text));
+    let configs = configs_for_level(level);
 
     let output = match &kind {
-        ContentKind::Json => match compress_json_array(text) {
+        ContentKind::Json => match compress_json_array(text, &configs.json) {
             Some(result) => Output {
                 compressed: result.content,
                 source: "json",
@@ -262,7 +372,7 @@ fn route_impl(
                     detail: Map::new(),
                 }
             } else {
-                let result = compress_log(&deduped, &LogCompressConfig::default());
+                let result = compress_log(&deduped, &configs.log);
                 Output {
                     detail: Map::from_iter([
                         (
@@ -287,7 +397,7 @@ fn route_impl(
                     detail: Map::new(),
                 }
             } else {
-                let result = compress_diff(text, "", &DiffCompressConfig::default());
+                let result = compress_diff(text, "", &configs.diff);
                 Output {
                     detail: Map::from_iter([
                         (
@@ -314,7 +424,11 @@ fn route_impl(
                 }
             } else {
                 match ensure_dedup_loaded(dedup_cache).and_then(|d| {
-                    d.dedupe(&deduped, PARAPHRASE_THRESHOLD, allow_punctuation_restore)
+                    d.dedupe(
+                        &deduped,
+                        configs.paraphrase_threshold,
+                        allow_punctuation_restore,
+                    )
                 }) {
                     Ok(result) => {
                         let stories: Vec<Value> = result
@@ -649,6 +763,70 @@ fn main() {
         return;
     }
 
+    if let Some(path) = &cli.session_stats {
+        let jsonl = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: failed to read {}: {e}", path.display());
+                std::process::exit(2);
+            }
+        };
+        let stats = session_stats::scan(&jsonl);
+
+        if cli.json {
+            let mut by_kind = Map::new();
+            for (kind, ks) in &stats.by_kind {
+                let mut m = Map::new();
+                m.insert("calls".to_string(), Value::from(ks.calls));
+                m.insert("chars_before".to_string(), Value::from(ks.chars_before));
+                m.insert("chars_after".to_string(), Value::from(ks.chars_after));
+                m.insert("chars_saved".to_string(), Value::from(ks.chars_saved()));
+                m.insert("pct_saved".to_string(), Value::from(ks.pct_saved()));
+                by_kind.insert(kind.clone(), Value::Object(m));
+            }
+            let mut json = Map::new();
+            json.insert("calls".to_string(), Value::from(stats.total.calls));
+            json.insert(
+                "chars_before".to_string(),
+                Value::from(stats.total.chars_before),
+            );
+            json.insert(
+                "chars_after".to_string(),
+                Value::from(stats.total.chars_after),
+            );
+            json.insert(
+                "chars_saved".to_string(),
+                Value::from(stats.total.chars_saved()),
+            );
+            json.insert(
+                "pct_saved".to_string(),
+                Value::from(stats.total.pct_saved()),
+            );
+            json.insert("by_kind".to_string(), Value::Object(by_kind));
+            println!("{}", Value::Object(json));
+        } else if stats.total.calls == 0 {
+            println!("no squishi --json calls found in this transcript");
+        } else {
+            for (kind, ks) in &stats.by_kind {
+                println!(
+                    "{kind}: {} calls, {} -> {} chars ({:.1}% saved)",
+                    ks.calls,
+                    ks.chars_before,
+                    ks.chars_after,
+                    ks.pct_saved()
+                );
+            }
+            println!(
+                "total: {} calls, {} -> {} chars ({:.1}% saved)",
+                stats.total.calls,
+                stats.total.chars_before,
+                stats.total.chars_after,
+                stats.total.pct_saved()
+            );
+        }
+        return;
+    }
+
     let forced = cli.force_kind.map(|f| match f {
         ForceKind::PlainText => ContentKind::PlainText,
     });
@@ -682,6 +860,7 @@ fn main() {
                 &mut dedup_cache,
                 allow_punctuation_restore,
                 include_embedding,
+                cli.level,
             );
             let mut json = build_output(&item_text, &kind, output);
             json.insert("id".to_string(), Value::from(id));
@@ -698,7 +877,7 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let (kind, output) = route_with_override(&text, forced);
+    let (kind, output) = route_with_level(&text, forced, cli.level);
     let json = build_output(&text, &kind, output);
 
     if cli.json {
