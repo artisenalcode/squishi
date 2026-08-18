@@ -63,8 +63,9 @@ and routes:
 - **Everything else** (`line_dedup`) — collapses runs of >5 identical
   consecutive lines. Safe, lossless-in-spirit; never destroys
   non-repeating structure. Content that doesn't match Json/SearchResults/
-  Log/PlainText gets a real sub-classification via `magika` (rust/html/
-  diff/csv/markdown/... — see below) rather than a blind catch-all, even
+  Log/PlainText gets a real sub-classification via Google's Magika model
+  (rust/html/diff/csv/markdown/... — see below) rather than a blind
+  catch-all, even
   though compression behavior is the same dedup-only pass for now (these
   are structured formats, not prose — sentence-level paraphrase dedup
   doesn't apply).
@@ -86,10 +87,24 @@ find nothing — where it's a genuine upgrade over the old blind
 `PlainText` catch-all: real file-type labels (rust, html, diff, csv,
 markdown, ...) instead of one undifferentiated bucket.
 
-Cost: ~111ms to load the model (`google/magika`'s official Rust crate —
-3.1MB, bundled directly in the crate, zero network calls, unlike
-Kompress's on-demand download) plus ~28ms/classification — only paid on
-the fallback path, never on content the regex checks already classified.
+Runs Google's real, unmodified `standard_v3_3` model (the same weights
+the official `magika` crate ships) directly through `candle-onnx`,
+instead of depending on that crate — squishi previously depended on it
+for exactly this, but it hard-pins an `ort` (ONNX Runtime) prerelease
+that repeatedly collided with other tools in this workspace; see
+`docs/ideation/ort-dependency-consistency/2026-08-18-ort-pin-and-bottleneck-plan.md`
+for the investigation, and `src/content_detect.rs`'s module doc comment
+for exactly which ops candle-onnx needed patched in to run this graph.
+The model (3.1MB) is embedded straight into the binary
+(`assets/magika-standard_v3_3.onnx`, zero network calls, unlike
+Kompress's on-demand download); the byte-feature-extraction algorithm
+and the per-label threshold/canonicalization table
+(`src/magika_labels.rs`) are ported line-for-line from the real
+`magika` crate's own source so classifications stay identical to what
+the official CLI reports. Cost: decodes once per process (well under a
+millisecond, cached in a `LazyLock`) plus per-classification inference
+time — only paid on the fallback path, never on content the regex
+checks already classified.
 
 Diff detection is also a fast regex tier, checked before Log: a
 `diff --git`/`--combined`/`--cc` header, or a naked `--- a/`/`--- /dev/null`
@@ -149,19 +164,25 @@ Sentence-level paraphrase dedup: collapse the same idea restated in
 different words, not just exact-duplicate lines (`line_dedup`'s job).
 Same model and greedy single-pass clustering algorithm as
 `advisory/tools/dedupe_semantic.py` (`sentence-transformers/all-MiniLM-
-L6-v2`, STS-tuned), ported to raw Rust `ort` — not `fastembed`:
-`fastembed` hard-pins `ort =2.0.0-rc.13`, incompatible with `magika`'s
-hard pin on `=2.0.0-rc.12` in the same crate, and measured slower
-besides (~1.07s warm via `fastembed` vs ~587-708ms warm via raw `ort`
-for the same model). Downloaded via `hf-hub` + run locally via
-`ort`/ONNX Runtime, cached after first use — same stack `total-recall`'s
-embeddings already prove out, just the raw API instead of the wrapper.
+L6-v2`, STS-tuned) — not `fastembed`: `fastembed` hard-pinned an `ort`
+version incompatible with what `magika` (this crate's other ONNX
+consumer at the time) required, and measured slower besides (~1.07s
+warm via `fastembed` vs ~587-708ms warm via raw `ort` for the same
+model). Ported off raw `ort` onto `candle` entirely on 2026-08-18 (see
+the Detection section above and
+`docs/ideation/ort-dependency-consistency/2026-08-18-ort-pin-and-bottleneck-plan.md`)
+— squishi no longer depends on `ort` at all, so it can't re-collide with
+another tool's `ort` resolution again. Re-measured against the same real
+model before the switch: cosine similarity 1.0 against the old `ort`
+output (bit-for-bit equivalent embeddings, not just "close enough"), and
+~40% faster (candle loads real HF safetensors directly, no ONNX
+conversion step). Downloaded via `hf-hub`, cached after first use.
 
 Wired into the default `compress` path for `PlainText`: line-dedup
 runs first, and only if the result stays over 2000 chars does
 `semantic_dedup` load the model and run. Sentences are split, embedded,
 mean-pooled + L2-normalized (the standard sentence-transformers recipe —
-raw ONNX output is per-token `last_hidden_state`, not pre-pooled),
+the raw model output is per-token `last_hidden_state`, not pre-pooled),
 then greedily deduped by cosine similarity (threshold 0.80, matching
 `dedupe_semantic.py`'s default). Sentences under 8 or over 40 words are
 never dropped — too short to be a meaningful whole-sentence paraphrase
@@ -182,16 +203,13 @@ If the model is unavailable (offline, first-run download fails), falls
 back to the line-dedup result rather than failing outright —
 `source: "dedup-semantic-unavailable"` in the JSON output signals this.
 
-`ort` is pinned to `=2.0.0-rc.12` — `magika` hard-pins `rc.12` even on
-its latest unreleased source, and `[patch]` can't bypass an exact pin
-from the same registry without forking.
-
 ## `--doctor` — self-diagnostics
 
 `squishi --doctor` checks this tool's own real failure surface instead of
 compressing anything: binary identity (which build is actually running,
-via `current_exe()` + crate version), whether magika loads, where the
-semantic-dedup model cache (`hf_hub::Api::new()`) actually resolves to and
+via `current_exe()` + crate version), whether the embedded Magika model
+classifies real content correctly, where the semantic-dedup model cache
+(`hf_hub::Api::new()`) actually resolves to and
 whether the model files are already cached there, whether semantic-dedup
 itself loads, and a best-effort proxy signal for the PostToolUse hook
 (file presence + `last-input.json`'s mtime — explicitly *not* a
@@ -359,9 +377,17 @@ that's the correct answer, not a false negative.
 
 ## Development
 
+Building `candle-onnx` (used by `content_detect`'s Magika path) needs a
+real `protoc` (Protocol Buffers compiler) binary on `PATH` or pointed to
+via `PROTOC=/path/to/protoc` — its `build.rs` calls `prost_build` at
+compile time. Not needed by anything else in this crate. No sudo
+required to get one: download a static release from
+[protocolbuffers/protobuf releases](https://github.com/protocolbuffers/protobuf/releases)
+and drop it somewhere on `PATH` (e.g. `~/.local/bin/protoc`).
+
 ```bash
-cargo test                    # fast — semantic_dedup's real-model tests are #[ignore]d
-cargo test -- --ignored       # slow — downloads/runs the real MiniLM model
+cargo test                    # fast — semantic_dedup/punctuation_restore's real-model tests are #[ignore]d
+cargo test -- --ignored       # slow — downloads/runs the real MiniLM + punctuation models
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```

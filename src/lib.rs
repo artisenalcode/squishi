@@ -6,6 +6,7 @@ pub mod invariants;
 pub mod json_compress;
 pub mod line_dedup;
 pub mod log_compress;
+mod magika_labels;
 pub mod pixel;
 pub mod punctuation_restore;
 pub mod search_compress;

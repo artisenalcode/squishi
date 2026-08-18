@@ -7,38 +7,51 @@ edition = "2024"
 clap = { version = "4.6.5", features = ["derive"] }
 regex = "1"
 serde_json = { version = "1", features = ["raw_value"] }
-# Was force-pinned to =2.0.0-rc.12 by magika 1.1.0's own exact pin (not
-# squishi's choice -- verified 2026-08-18, see
-# docs/ideation/ort-dependency-consistency/2026-08-18-ort-pin-and-bottleneck-plan.md
-# for the full investigation). Unblocked by patching magika below to allow
-# rc.13 instead -- proven safe first (real build + real classification runs
-# against real files, not just "it compiles"), not assumed. rc.13 is also
-# what total-recall's fastembed dependency already resolves to, so this is
-# real cross-repo version consistency, not just an unblock.
-ort = { version = "2.0.0-rc.13", default-features = false, features = ["download-binaries", "tls-rustls", "std"] }
 hf-hub = { version = "=0.5.0", default-features = false, features = ["rustls-tls", "ureq"] }
 tokenizers = "=0.22.2"
 
-magika = "1.1.0"
 dirs = "6.0.0"
 spleen-font = { version = "0.2.0", features = ["s5x8"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 clap_mangen = "0.3.3"
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+candle-transformers = "0.11.0"
+# candle-onnx itself is unpatched upstream 0.11.0 except for the eval.rs ops
+# magika's own ONNX graph needs and upstream candle-onnx doesn't implement:
+# Int32 inputs, Max, Reciprocal, GlobalMaxPool. See [patch.crates-io] below --
+# verified 2026-08-18 against real magika model.onnx, exact label match against
+# the real magika CLI (see content_detect.rs's module doc comment).
+candle-onnx = "0.11.0"
+# Only for ModelProto::decode() on the embedded model bytes (see
+# content_detect.rs) -- matches candle-onnx's own prost version exactly
+# so there's one resolved copy, not two.
+prost = "0.14.1"
 
 [dev-dependencies]
 tempfile = "3.27.0"
 
-# magika 1.1.0's real exact `ort =2.0.0-rc.12` pin, patched to allow
-# rc.13, on a real, tested fork -- verified 2026-08-18: cargo build --lib
-# compiles clean with zero source changes to magika's own code (the
-# rc.12->rc.13 breaking changes are execution-provider gating and a
-# custom-operator API overhaul, neither used here), and the real magika
-# CLI rebuilt against it correctly classifies real files at runtime
-# (Rust source -> "rust" 0.999, Markdown -> "markdown" 0.999, JSON ->
-# "json" 0.503). Same model weights, same behavior, only the ort
-# constraint changed. Fork: github.com/artisenalcode/magika, branch
-# relax-ort-version-pin. A PR upstream to google/magika may eventually
-# make this patch unnecessary -- revisit then, don't assume it's still
-# needed without checking.
+# 2026-08-18: ort/magika dropped entirely -- semantic_dedup.rs,
+# punctuation_restore.rs, and content_detect.rs all now run on candle
+# directly (native safetensors for the first two, candle-onnx for magika's
+# own model.onnx in content_detect.rs). This removes the version-pin
+# conflict that motivated the whole investigation
+# (docs/ideation/ort-dependency-consistency/2026-08-18-ort-pin-and-bottleneck-plan.md):
+# squishi no longer depends on ort at all, so it can never re-collide with
+# total-recall's fastembed->ort resolution again.
+#
+# candle-onnx 0.11.0 on crates.io doesn't implement four ops magika's real
+# model.onnx graph needs (Int32 inputs, Max, Reciprocal, GlobalMaxPool) --
+# patched on a fork, verified 2026-08-18 against the real model: exact
+# label match against the real magika CLI on real files (rust 0.9999454,
+# markdown 0.99917597). candle-core/nn/transformers are patched to the same
+# fork/rev alongside candle-onnx purely so the whole graph resolves to one
+# consistent source instead of two copies of 0.11.0 (path-dep vs registry)
+# -- those three crates are themselves unmodified from upstream 0.11.0 in
+# this fork, only candle-onnx/src/eval.rs changed. Fork:
+# github.com/artisenalcode/candle, branch fix-onnx-magika-ops.
 [patch.crates-io]
-magika = { git = "https://github.com/artisenalcode/magika.git", rev = "4f42dfd7414263a34c4a118ab2f87b33c6a92cb6" }
+candle-core = { git = "https://github.com/artisenalcode/candle.git", rev = "6ab585991d52b23eec1bb1789217707b8a8e636c" }
+candle-nn = { git = "https://github.com/artisenalcode/candle.git", rev = "6ab585991d52b23eec1bb1789217707b8a8e636c" }
+candle-transformers = { git = "https://github.com/artisenalcode/candle.git", rev = "6ab585991d52b23eec1bb1789217707b8a8e636c" }
+candle-onnx = { git = "https://github.com/artisenalcode/candle.git", rev = "6ab585991d52b23eec1bb1789217707b8a8e636c" }

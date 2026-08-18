@@ -1,8 +1,9 @@
 //! Self-diagnostics — checks this tool's own real failure surface (which
-//! binary is actually running, whether magika loads, where the semantic-
-//! dedup model cache resolves to and whether it's already warm, and a
-//! best-effort proxy for whether the PostToolUse hook has fired recently)
-//! and reports pass/warn/fail per check.
+//! binary is actually running, whether the magika model classifies real
+//! content correctly, where the semantic-dedup model cache resolves to
+//! and whether it's already warm, and a best-effort proxy for whether
+//! the PostToolUse hook has fired recently) and reports pass/warn/fail
+//! per check.
 //!
 //! Modeled on `agent-browser doctor` (audited 2026-08-07,
 //! docs/ideation/audit-repo-techniques/2026-08-07-enrichment-techniques.md)
@@ -78,8 +79,11 @@ impl DoctorReport {
     }
 }
 
-/// Run every check. `quick` skips the two expensive model-load checks
-/// (magika, semantic-dedup) — mirrors total-recall's own `--quick`.
+/// Run every check. `quick` skips the two model-load checks (magika,
+/// semantic-dedup) — mirrors total-recall's own `--quick`. Only
+/// semantic-dedup is genuinely expensive since the 2026-08-18 candle-onnx
+/// migration (real network/disk model fetch); magika's check is cheap
+/// now but stays gated for output stability, see `check_magika_loads`.
 pub fn run(quick: bool) -> DoctorReport {
     let checks = vec![
         check_binary_identity(),
@@ -112,6 +116,14 @@ fn check_binary_identity() -> Check {
     }
 }
 
+/// 2026-08-18: `magika::Session::new()` (ort) replaced by a real
+/// classification through `content_detect::detect()` (candle-onnx) —
+/// see content_detect.rs's module doc comment for why. This check is no
+/// longer expensive to run (the embedded model decodes once, lazily, in
+/// well under a millisecond — no ~111ms `ort::Session` build) but stays
+/// gated behind `--quick` for output stability with the rest of this
+/// function's contract, and because a real classification is still a
+/// stronger signal than "the model bytes decoded."
 fn check_magika_loads(quick: bool) -> Check {
     let name = "magika_loads".to_string();
     if quick {
@@ -121,16 +133,20 @@ fn check_magika_loads(quick: bool) -> Check {
             message: "skipped (--quick)".to_string(),
         };
     }
-    match magika::Session::new() {
-        Ok(_) => Check {
+    let sample = "fn main() {\n    let x = 5;\n    println!(\"{}\", x);\n}\n";
+    match crate::content_detect::detect(sample) {
+        crate::content_detect::ContentKind::Other(label) if label == "rust" => Check {
             name,
             status: Status::Pass,
-            message: "magika session loads".to_string(),
+            message: "candle-onnx magika model loads and classifies real Rust source correctly"
+                .to_string(),
         },
-        Err(e) => Check {
+        other => Check {
             name,
             status: Status::Fail,
-            message: format!("magika session failed to load: {e}"),
+            message: format!(
+                "magika model loaded but misclassified a known-rust sample as {other:?}"
+            ),
         },
     }
 }
@@ -168,7 +184,7 @@ fn check_model_cache_location() -> Check {
     };
     if cache_dir.exists() {
         let model_present = cache_dir
-            .join("models--Qdrant--all-MiniLM-L6-v2-onnx")
+            .join("models--sentence-transformers--all-MiniLM-L6-v2")
             .exists();
         Check {
             name,

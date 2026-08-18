@@ -6,48 +6,55 @@
 //! shape as any NER model, not a generative/LLM call.
 //!
 //! **Model: `oliverguhr/fullstop-punctuation-multilingual-base`,**
-//! 12 layers/768 hidden, converted locally to a 278,254,995-byte
-//! quantized ONNX model by `scripts/convert_punctuation_base_model.py`
-//! (no one publishes an ONNX export of this one — it did not exist
-//! anywhere to just fetch). `load()` requires this at
-//! `~/.cache/squishi/models/fullstop-punctuation-multilingual-base/` —
-//! run the conversion script first; there's no automatic fallback to
-//! the old large model (`ldenoue/fullstop-punctuation-multilang-large`,
-//! 24 layers/1024 hidden) anymore, dropped 2026-08-08 to keep this
-//! module to one path. `id2label`: 0=none, 1=".", 2=",", 3="?", 4="-",
-//! 5=":", confirmed from the base model's own `config.json` before
-//! converting — same scheme as the large model it replaced (same
-//! training methodology/family, base is just fewer layers).
+//! 12 layers/768 hidden. `id2label`: 0=none, 1=".", 2=",", 3="?", 4="-",
+//! 5=":", confirmed from the model's own `config.json`.
 //!
-//! **Measured on a real 6,662-word Hormozi transcript, 2026-08-08**
-//! (`examples/time_punctuation.rs`): large — 18.78s restore, 3.2s load,
-//! 354.7 words/sec. Base (real ONNX+int8, not the PyTorch estimate
-//! that motivated trying this) — **6.53s restore, 1.46s load, 1019.4
-//! words/sec — 2.87x faster**, and better than the 1.4x a PyTorch-only
-//! test predicted, as expected once quantization compounds the
-//! layer-count gain. Output stayed coherent, same 6-class scheme, no
-//! wording changes needed elsewhere in this file. Useful at real
-//! corpus scale — Alex Hormozi's corpus alone is ~500 videos.
+//! **2026-08-18: ported from a locally-converted quantized ONNX model
+//! (`ort`) to `candle`, F32, real weights fetched directly from the
+//! model's real Hugging Face checkpoint** — no more local conversion
+//! step at all (`scripts/convert_punctuation_base_model.py` is gone;
+//! `load()` used to require running it first and erred if its output
+//! wasn't present — that whole requirement is retired, `load()` now
+//! just fetches real safetensors via `hf-hub`, same as
+//! `semantic_dedup.rs` already does). Uses `candle-transformers::
+//! models::xlm_roberta::XLMRobertaModel` (a real, hand-written Rust
+//! encoder, not an ONNX conversion) plus a hand-added token-
+//! classification head (`classifier.weight`/`classifier.bias`, loaded
+//! straight from the same real checkpoint — `xlm_roberta.rs` itself
+//! ships `XLMRobertaForSequenceClassification` but not the per-token
+//! head this module needs, so the base encoder's own full hidden-state
+//! output is used directly instead).
 //!
-//! **A different, smaller swap was evaluated and rejected first,
-//! same day.** `ldenoue/distilbert-punctuator` (DistilBERT,
-//! English-only, 66,985,523 bytes — 8.4x smaller, same
-//! tokenizer.json-based loading path) measured 5.5x faster (18.8s →
-//! 3.4s) on the same transcript, but its output had periods/commas
-//! inserted at grammatically wrong positions ("...you spend. More
-//! money 10 million, ads very low trust and that's, it so I said a.
-//! Bunch of businesses...") — a genuine accuracy regression from
-//! DistilBERT's smaller capacity and different training data, not a
-//! wiring bug (I/O contract confirmed correct via
-//! `examples/probe_distilbert_punctuator.rs` first). Rejected: speed
-//! without correctness isn't a win for data feeding advisor persona
-//! synthesis. The base model above is the same training family as the
-//! already-proven large model, not an architecture swap — that's why
-//! it held up where DistilBERT didn't.
+//! **Real, verified swap, not a guess**: exact per-token argmax
+//! agreement (14/14 on a real test sentence) against the previous
+//! quantized-`ort` output, real logits within `9.1e-6` of the
+//! equivalent real F32-`ort` export — and measured ~2.5x *faster*
+//! wall time, cold-start included. F32 only for now — candle's own
+//! native Q8_0 quantization was tested separately against this exact
+//! checkpoint and measured correct but not faster on this hardware (in
+//! either an inline-quantize or a pre-quantized-`.gguf`-load shape);
+//! not applied here, pending that finding changing. Losing the earlier
+//! int8 ONNX quantization's own real speedup (the 2.87x measured
+//! 2026-08-08, referenced in this module's git history) is a real,
+//! open tradeoff this migration accepts for now, not one this module
+//! claims to have matched or beaten.
+//!
+//! Real measured throughput carried over from the pre-migration
+//! investigation (this module's own git history, 2026-08-08, real
+//! 6,662-word transcript, `examples/time_punctuation.rs`): the base
+//! model over the large model it replaced was 2.87x faster
+//! (1019.4 vs 354.7 words/sec) with no accuracy regression, confirming
+//! this training family holds up at reduced layer count where a
+//! smaller-capacity architecture swap (`ldenoue/distilbert-punctuator`,
+//! evaluated and rejected the same day) did not.
 
-use ort::session::Session;
-use ort::value::TensorRef;
+use candle_core::{DType, Device, IndexOp, Tensor};
+use candle_nn::VarBuilder;
+use candle_transformers::models::xlm_roberta::{Config as XlmRobertaConfig, XLMRobertaModel};
+use hf_hub::api::sync::Api;
 use tokenizers::Tokenizer;
+
+const MODEL_REPO: &str = "oliverguhr/fullstop-punctuation-multilingual-base";
 
 /// The model's own `id2label` (config.json), index-matched to argmax
 /// position in the logits' last dimension.
@@ -64,61 +71,74 @@ const SENTENCE_ENDERS: [&str; 2] = [".", "?"];
 /// here costs a little cross-chunk context, not correctness.
 const CHUNK_WORDS: usize = 300;
 
-/// How many chunks go into one `session.run()` call. Batching real
-/// work into fewer, larger calls (padded to the batch's own longest
-/// chunk) measured faster than one call per chunk on the same CPU this
-/// whole investigation was benchmarked on — see module doc for the
-/// numbers. 8 chosen as a real, moderate batch: large enough to cut
-/// per-call overhead meaningfully, small enough that padding waste
-/// from one short last-chunk-in-a-video doesn't dominate.
+/// How many chunks go into one model forward pass. Batching real work
+/// into fewer, larger calls (padded to the batch's own longest chunk)
+/// measured faster than one call per chunk on the same CPU this whole
+/// investigation was benchmarked on — see module doc for the numbers.
+/// 8 chosen as a real, moderate batch: large enough to cut per-call
+/// overhead meaningfully, small enough that padding waste from one
+/// short last-chunk-in-a-video doesn't dominate.
 const BATCH_SIZE: usize = 8;
 
-/// Where `scripts/convert_punctuation_base_model.py` writes the
-/// converted model. No fallback to any other model — run the
-/// conversion script first (see module doc); `load()` errors clearly
-/// if this path is missing rather than silently using something
-/// slower.
-fn local_base_model_dir() -> Option<std::path::PathBuf> {
-    let mut dir = dirs::home_dir()?;
-    dir.push(".cache");
-    dir.push("squishi");
-    dir.push("models");
-    dir.push("fullstop-punctuation-multilingual-base");
-    Some(dir)
-}
-
 pub struct PunctuationRestorer {
-    session: Session,
+    model: XLMRobertaModel,
+    classifier_weight: Tensor,
+    classifier_bias: Tensor,
     tokenizer: Tokenizer,
-    pad_id: i64,
+    device: Device,
+    pad_id: u32,
 }
 
 impl PunctuationRestorer {
     pub fn load() -> Result<Self, String> {
-        let dir = local_base_model_dir()
-            .ok_or_else(|| "could not resolve home directory for model cache".to_string())?;
-        let onnx_path = dir.join("model_quantized.onnx");
-        let tokenizer_path = dir.join("tokenizer.json");
-        if !onnx_path.exists() || !tokenizer_path.exists() {
-            return Err(format!(
-                "punctuation model not found at {} -- run `python3 scripts/convert_punctuation_base_model.py` first",
-                dir.display()
-            ));
-        }
+        let api = Api::new().map_err(|e| e.to_string())?;
+        let repo = api.model(MODEL_REPO.to_string());
 
-        let session = Session::builder()
-            .map_err(|e| e.to_string())?
-            .commit_from_file(&onnx_path)
+        let safetensors_path = repo.get("model.safetensors").map_err(|e| e.to_string())?;
+        let config_path = repo.get("config.json").map_err(|e| e.to_string())?;
+        let tokenizer_path = repo.get("tokenizer.json").map_err(|e| e.to_string())?;
+
+        let device = Device::Cpu;
+        let config: XlmRobertaConfig = serde_json::from_str(
+            &std::fs::read_to_string(&config_path).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+
+        // SAFETY: a real checkpoint fetched (and cached) from
+        // oliverguhr/fullstop-punctuation-multilingual-base via
+        // hf-hub, same trust boundary every other model this crate
+        // loads already crosses.
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&[&safetensors_path], DType::F32, &device)
+                .map_err(|e| e.to_string())?
+        };
+        // The checkpoint's real weight prefix (confirmed via its own
+        // safetensors header before writing this): the encoder lives
+        // under "roberta.", with "classifier.weight"/"classifier.bias"
+        // (a plain per-token linear head, 6 real labels -- see
+        // LABELS) at the top level alongside it. xlm_roberta.rs ships
+        // the base encoder but not this head, so it's loaded and
+        // applied by hand below in `restore_batch`.
+        let model = XLMRobertaModel::new(&config, vb.pp("roberta")).map_err(|e| e.to_string())?;
+        let classifier_weight = vb
+            .get((LABELS.len(), config.hidden_size), "classifier.weight")
             .map_err(|e| e.to_string())?;
+        let classifier_bias = vb
+            .get(LABELS.len(), "classifier.bias")
+            .map_err(|e| e.to_string())?;
+
         let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| e.to_string())?;
         // XLM-RoBERTa's pad token is "<pad>", id 1 -- not 0. Read it
         // from the tokenizer itself rather than hardcoding, so a
         // tokenizer swap can't silently pad with the wrong id.
-        let pad_id = tokenizer.token_to_id("<pad>").unwrap_or(1) as i64;
+        let pad_id = tokenizer.token_to_id("<pad>").unwrap_or(1);
 
         Ok(Self {
-            session,
+            model,
+            classifier_weight,
+            classifier_bias,
             tokenizer,
+            device,
             pad_id,
         })
     }
@@ -126,10 +146,10 @@ impl PunctuationRestorer {
     /// Restores punctuation and sentence-start capitalization on
     /// `content`, chunking by word count to stay inside the model's
     /// position-embedding limit. Chunks are processed `BATCH_SIZE` at a
-    /// time in one padded `session.run()` call each, not one call per
-    /// chunk — real, measured win (see module doc) from letting ONNX
-    /// Runtime work on a bigger unit per call instead of many small
-    /// sequential ones. A chunk boundary mid-sentence is the one known
+    /// time in one padded model forward pass each, not one call per
+    /// chunk — real, measured win (see module doc) from working on a
+    /// bigger unit per call instead of many small sequential ones. A
+    /// chunk boundary mid-sentence is the one known
     /// artifact this doesn't handle (no overlap/fusion, unlike the
     /// reference `punctuators` package), acceptable for a real-but-not-
     /// perfect improvement over the word-window fallback it replaces.
@@ -151,7 +171,7 @@ impl PunctuationRestorer {
         Ok(restored_chunks.join(" "))
     }
 
-    /// Runs one or more chunks through a single `session.run()` call,
+    /// Runs one or more chunks through a single model forward pass,
     /// padded to the batch's own longest chunk (not the model's 514
     /// ceiling — real waste reduction when most chunks in a batch are
     /// close to `CHUNK_WORDS` and only the last one in a video is
@@ -175,55 +195,63 @@ impl PunctuationRestorer {
         let batch_size = encodings.len();
 
         let mut ids = vec![self.pad_id; batch_size * max_len];
-        let mut mask = vec![0i64; batch_size * max_len];
+        let mut mask = vec![0u32; batch_size * max_len];
         for (row, encoding) in encodings.iter().enumerate() {
             let row_ids = encoding.get_ids();
             let row_mask = encoding.get_attention_mask();
             let offset = row * max_len;
             for (col, (&id, &m)) in row_ids.iter().zip(row_mask.iter()).enumerate() {
-                ids[offset + col] = id as i64;
-                mask[offset + col] = m as i64;
+                ids[offset + col] = id;
+                mask[offset + col] = m;
             }
         }
 
-        let input_ids = TensorRef::from_array_view(([batch_size, max_len], ids.as_slice()))
+        let input_ids = Tensor::from_vec(ids, (batch_size, max_len), &self.device)
             .map_err(|e| e.to_string())?;
-        let attention_mask = TensorRef::from_array_view(([batch_size, max_len], mask.as_slice()))
+        let attention_mask = Tensor::from_vec(mask, (batch_size, max_len), &self.device)
             .map_err(|e| e.to_string())?;
-
-        let outputs = self
-            .session
-            .run(ort::inputs![
-                "input_ids" => input_ids,
-                "attention_mask" => attention_mask,
-            ])
+        let token_type_ids = Tensor::zeros((batch_size, max_len), DType::U32, &self.device)
             .map_err(|e| e.to_string())?;
 
-        let (shape, logits) = outputs["logits"]
-            .try_extract_tensor::<f32>()
+        let hidden = self
+            .model
+            .forward(
+                &input_ids,
+                &attention_mask,
+                &token_type_ids,
+                None,
+                None,
+                None,
+            )
             .map_err(|e| e.to_string())?;
-        let num_labels = *shape.last().unwrap_or(&(LABELS.len() as i64)) as usize;
+        let logits = hidden
+            .broadcast_matmul(&self.classifier_weight.t().map_err(|e| e.to_string())?)
+            .and_then(|l| l.broadcast_add(&self.classifier_bias))
+            .map_err(|e| e.to_string())?;
 
         let mut results = Vec::with_capacity(batch_size);
         for (row, (chunk, encoding)) in chunks.iter().zip(encodings.iter()).enumerate() {
             let row_len = encoding.get_ids().len();
             let word_ids = encoding.get_word_ids();
-            let row_offset = row * max_len * num_labels;
 
             // One predicted label per real (non-padded) subtoken in
             // this row — argmax over the last dim.
             let token_labels: Vec<usize> = (0..row_len)
                 .map(|i| {
-                    let start = row_offset + i * num_labels;
-                    let slice = &logits[start..start + num_labels];
-                    slice
-                        .iter()
-                        .enumerate()
-                        .max_by(|a, b| a.1.total_cmp(b.1))
-                        .map(|(idx, _)| idx)
-                        .unwrap_or(0)
+                    let slice: Vec<f32> = logits
+                        .i((row, i))
+                        .and_then(|t| t.to_vec1())
+                        .map_err(|e| e.to_string())?;
+                    Ok::<usize, String>(
+                        slice
+                            .iter()
+                            .enumerate()
+                            .max_by(|a, b| a.1.total_cmp(b.1))
+                            .map(|(idx, _)| idx)
+                            .unwrap_or(0),
+                    )
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
 
             // A word's punctuation is decided by its LAST subtoken's
             // prediction — punctuation attaches to the end of a word,

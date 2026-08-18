@@ -42,7 +42,7 @@ struct Cli {
     #[arg(long)]
     doctor: bool,
 
-    /// With --doctor, skip the two expensive model-load checks (magika,
+    /// With --doctor, skip the two model-load checks (magika,
     /// semantic-dedup). Ignored without --doctor.
     #[arg(long)]
     quick: bool,
