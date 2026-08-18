@@ -7,7 +7,18 @@ edition = "2024"
 clap = { version = "4.6.5", features = ["derive"] }
 regex = "1"
 serde_json = { version = "1", features = ["raw_value"] }
-ort = { version = "=2.0.0-rc.12", default-features = false, features = ["download-binaries", "tls-rustls", "std"] }
+# Not squishi's own pin -- magika 1.1.0 (below) hard-pins `ort =2.0.0-rc.12`
+# in its own Cargo.toml; verified 2026-08-18 that bumping past it fails
+# resolution (`cargo update -p ort --precise 2.0.0-rc.13` names magika as
+# the blocker; confirmed magika's own upstream `main`, even the unreleased
+# 1.1.1-dev, still has the identical exact pin -- no relaxation in
+# progress). This line has no `=` because it isn't squishi's restriction to
+# assert -- Cargo resolves the exact same version regardless, since magika
+# forces it either way. See docs/ideation/ort-dependency-consistency/
+# 2026-08-18-ort-pin-and-bottleneck-plan.md for the real investigation into
+# whether this is worth removing (it also blocks total-recall, which is
+# separately forced to a DIFFERENT ort version via fastembed).
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["download-binaries", "tls-rustls", "std"] }
 hf-hub = { version = "=0.5.0", default-features = false, features = ["rustls-tls", "ureq"] }
 tokenizers = "=0.22.2"
 
