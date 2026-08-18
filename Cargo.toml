@@ -7,18 +7,15 @@ edition = "2024"
 clap = { version = "4.6.5", features = ["derive"] }
 regex = "1"
 serde_json = { version = "1", features = ["raw_value"] }
-# Not squishi's own pin -- magika 1.1.0 (below) hard-pins `ort =2.0.0-rc.12`
-# in its own Cargo.toml; verified 2026-08-18 that bumping past it fails
-# resolution (`cargo update -p ort --precise 2.0.0-rc.13` names magika as
-# the blocker; confirmed magika's own upstream `main`, even the unreleased
-# 1.1.1-dev, still has the identical exact pin -- no relaxation in
-# progress). This line has no `=` because it isn't squishi's restriction to
-# assert -- Cargo resolves the exact same version regardless, since magika
-# forces it either way. See docs/ideation/ort-dependency-consistency/
-# 2026-08-18-ort-pin-and-bottleneck-plan.md for the real investigation into
-# whether this is worth removing (it also blocks total-recall, which is
-# separately forced to a DIFFERENT ort version via fastembed).
-ort = { version = "2.0.0-rc.12", default-features = false, features = ["download-binaries", "tls-rustls", "std"] }
+# Was force-pinned to =2.0.0-rc.12 by magika 1.1.0's own exact pin (not
+# squishi's choice -- verified 2026-08-18, see
+# docs/ideation/ort-dependency-consistency/2026-08-18-ort-pin-and-bottleneck-plan.md
+# for the full investigation). Unblocked by patching magika below to allow
+# rc.13 instead -- proven safe first (real build + real classification runs
+# against real files, not just "it compiles"), not assumed. rc.13 is also
+# what total-recall's fastembed dependency already resolves to, so this is
+# real cross-repo version consistency, not just an unblock.
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["download-binaries", "tls-rustls", "std"] }
 hf-hub = { version = "=0.5.0", default-features = false, features = ["rustls-tls", "ureq"] }
 tokenizers = "=0.22.2"
 
@@ -30,3 +27,18 @@ clap_mangen = "0.3.3"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# magika 1.1.0's real exact `ort =2.0.0-rc.12` pin, patched to allow
+# rc.13, on a real, tested fork -- verified 2026-08-18: cargo build --lib
+# compiles clean with zero source changes to magika's own code (the
+# rc.12->rc.13 breaking changes are execution-provider gating and a
+# custom-operator API overhaul, neither used here), and the real magika
+# CLI rebuilt against it correctly classifies real files at runtime
+# (Rust source -> "rust" 0.999, Markdown -> "markdown" 0.999, JSON ->
+# "json" 0.503). Same model weights, same behavior, only the ort
+# constraint changed. Fork: github.com/artisenalcode/magika, branch
+# relax-ort-version-pin. A PR upstream to google/magika may eventually
+# make this patch unnecessary -- revisit then, don't assume it's still
+# needed without checking.
+[patch.crates-io]
+magika = { git = "https://github.com/artisenalcode/magika.git", rev = "4f42dfd7414263a34c4a118ab2f87b33c6a92cb6" }
