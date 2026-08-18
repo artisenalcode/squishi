@@ -7,6 +7,7 @@ use squishi::doctor;
 use squishi::invariants::InvariantConfig;
 use squishi::json_compress::{JsonCompressConfig, compress_json_array};
 use squishi::line_dedup::dedupe_line_runs;
+use squishi::line_number_strip::strip_read_tool_line_numbers;
 use squishi::log_compress::{LogCompressConfig, compress_log};
 use squishi::search_compress::compress_search_results;
 use squishi::semantic_dedup::{SemanticDedup, SentenceShape};
@@ -340,6 +341,18 @@ fn route_impl(
     include_embedding: bool,
     level: Level,
 ) -> (ContentKind, Output) {
+    // Unconditional pre-pass, not a ContentKind of its own — Claude
+    // Code's real Read tool wraps file content in a `cat -n`-style
+    // `N\t<line>` prefix, which confuses both detect() (Magika
+    // classifies it as Other("tsv"), a kind squishi has no compressor
+    // for) and every line-anchored fast-path regex (Diff/Log/
+    // SearchResults). Stripped before detection runs — real finding from
+    // governator-proxy's Step 2 live-API check, see
+    // line_number_strip.rs's own module doc comment for the real
+    // before/after numbers.
+    let (text, line_numbers_stripped) = strip_read_tool_line_numbers(text);
+    let text = text.as_str();
+
     // Unconditional pre-pass, not a ContentKind of its own — a base64 blob
     // (an embedded screenshot, a data-URI) can appear inside any shape
     // detect() classifies below, so it's stripped before detection runs,
@@ -550,6 +563,11 @@ fn route_impl(
     };
 
     let mut output = output;
+    if line_numbers_stripped {
+        output
+            .detail
+            .insert("line_numbers_stripped".to_string(), Value::from(true));
+    }
     if base64_blobs_removed > 0 {
         output.detail.insert(
             "base64_blobs_removed".to_string(),
@@ -1108,6 +1126,44 @@ mod tests {
         assert!(
             !output.detail.contains_key("base64_blobs_removed"),
             "base64_blobs_removed should be absent, not zero, when nothing was stripped"
+        );
+    }
+
+    #[test]
+    fn real_read_tool_shaped_input_gets_its_line_numbers_stripped_before_routing() {
+        // Real shape captured from governator-proxy's Step 2 live-API
+        // check: Claude Code's real Read tool numbers every line
+        // `N\t<content>`, which used to route to ContentKind::Other("tsv")
+        // (Magika misreading the tab-separated shape) and get zero real
+        // compression. This is the real end-to-end regression guard, not
+        // just line_number_strip.rs's own isolated unit tests.
+        let lines: Vec<String> = (1..=30)
+            .map(|i| format!("routine status line number {i} with no special structure at all"))
+            .collect();
+        let numbered: String = lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| format!("{}\t{l}\n", i + 1))
+            .collect();
+        let (kind, output) = route(&numbered);
+        assert_ne!(
+            kind,
+            ContentKind::Other("tsv".to_string()),
+            "should no longer be misread as TSV once the line-number prefix is stripped"
+        );
+        assert_eq!(output.detail["line_numbers_stripped"], Value::from(true));
+        assert!(
+            !output.compressed.contains('\t'),
+            "the stripped prefix shouldn't reappear in the compressed output"
+        );
+    }
+
+    #[test]
+    fn content_with_no_line_numbering_has_no_line_numbers_stripped_key() {
+        let (_, output) = route("just a normal paragraph of prose with no special structure.");
+        assert!(
+            !output.detail.contains_key("line_numbers_stripped"),
+            "line_numbers_stripped should be absent, not false, when nothing was stripped"
         );
     }
 

@@ -5,6 +5,7 @@ pub mod doctor;
 pub mod invariants;
 pub mod json_compress;
 pub mod line_dedup;
+pub mod line_number_strip;
 pub mod log_compress;
 mod magika_labels;
 pub mod pixel;
