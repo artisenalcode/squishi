@@ -259,11 +259,18 @@ re-verify — so it's opt-in via `--include-rule-2` until real usage data
 justifies flipping the default.
 
 **No live transcript mutation, ever.** Confirmed against the real Claude
-Code hooks reference: no hook can rewrite a past transcript entry —
-`PostToolUse`'s `updatedToolOutput` only applies to the *current* tool
-call. `--write` always produces a new copy; the input transcript is
-never touched, by this tool or (today) by anything that could feed its
-output back into a live session automatically.
+Code hooks reference (code.claude.com/docs/en/hooks, 2026-08-18): no hook
+can rewrite a past transcript entry at all — `PostToolUse` has no field
+that replaces or edits tool output ("`PostToolUse` hooks can't undo
+actions since the tool has already executed" is the doc's own wording);
+its only output mechanism, `hookSpecificOutput.additionalContext`,
+appends text alongside the original result, never removes or replaces it.
+An earlier version of this note cited a `updatedToolOutput` field as the
+scoping reason — that field does not exist in the real API, found the
+hard way building `agents-brain`'s now-retired PostToolUse compress hook.
+`--write` always produces a new copy regardless; the input transcript is
+never touched, by this tool or by anything else, structurally not just by
+convention.
 
 Not a subcommand — same "flag not subcommand" reasoning as `--doctor`.
 

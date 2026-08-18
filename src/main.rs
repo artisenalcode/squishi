@@ -4,6 +4,7 @@ use squishi::base64_strip::strip_base64_blobs;
 use squishi::content_detect::{ContentKind, detect};
 use squishi::diff_compress::{DiffCompressConfig, compress_diff};
 use squishi::doctor;
+use squishi::invariants::InvariantConfig;
 use squishi::json_compress::{JsonCompressConfig, compress_json_array};
 use squishi::line_dedup::dedupe_line_runs;
 use squishi::log_compress::{LogCompressConfig, compress_log};
@@ -12,6 +13,7 @@ use squishi::semantic_dedup::{SemanticDedup, SentenceShape};
 use squishi::session_digest;
 use squishi::session_prune;
 use squishi::session_stats;
+use squishi::toon;
 
 #[derive(Parser)]
 #[command(
@@ -140,6 +142,18 @@ struct Cli {
     /// `--session-prune`/`--session-digest` (out of scope for this flag).
     #[arg(long, value_enum, default_value_t = Level::Default)]
     level: Level,
+
+    /// Encode `text` (must be valid JSON) as TOON instead of running the
+    /// normal detect+compress pipeline — same "flag not subcommand"
+    /// reasoning as --doctor. Real, public, MIT-licensed format
+    /// (github.com/toon-format/spec, SPEC v4.1) — lossless, so unlike
+    /// every other mode here, nothing is ever elided or dropped, only
+    /// re-encoded. Only ships TOON if it measures smaller than the JSON
+    /// input; otherwise the original JSON is printed unchanged, same
+    /// "never ship a result that isn't actually smaller" discipline every
+    /// other compressor in this crate already follows.
+    #[arg(long)]
+    toon: bool,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy)]
@@ -187,7 +201,10 @@ fn configs_for_level(level: Level) -> LevelConfigs {
                 context_lines: 4,
                 max_total_lines: 200,
             },
-            json: JsonCompressConfig { keep_edge: 10 },
+            json: JsonCompressConfig {
+                keep_edge: 10,
+                invariants: InvariantConfig::default(),
+            },
         },
         Level::Default => LevelConfigs {
             paraphrase_threshold: PARAPHRASE_THRESHOLD,
@@ -208,7 +225,10 @@ fn configs_for_level(level: Level) -> LevelConfigs {
                 context_lines: 1,
                 max_total_lines: 50,
             },
-            json: JsonCompressConfig { keep_edge: 2 },
+            json: JsonCompressConfig {
+                keep_edge: 2,
+                invariants: InvariantConfig::default(),
+            },
         },
     }
 }
@@ -646,6 +666,43 @@ fn main() {
             }
         }
         std::process::exit(if report.has_failures() { 1 } else { 0 });
+    }
+
+    if cli.toon {
+        let text = match read_input(&cli) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
+        };
+        let value: Value = match serde_json::from_str(text.trim()) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("error: --toon requires valid JSON input: {e}");
+                std::process::exit(2);
+            }
+        };
+        let chars_before = text.len();
+        let (compressed, source) = match toon::encode_if_smaller(&value) {
+            Some(toon_text) => (toon_text, "toon"),
+            None => (
+                serde_json::to_string(&value).unwrap_or_else(|_| text.clone()),
+                "toon-not-smaller",
+            ),
+        };
+        let chars_after = compressed.len();
+        if cli.json {
+            let mut json = Map::new();
+            json.insert("compressed".to_string(), Value::from(compressed));
+            json.insert("source".to_string(), Value::from(source));
+            json.insert("chars_before".to_string(), Value::from(chars_before));
+            json.insert("chars_after".to_string(), Value::from(chars_after));
+            println!("{}", Value::Object(json));
+        } else {
+            println!("{compressed}");
+        }
+        return;
     }
 
     if let Some(path) = &cli.session_prune {

@@ -422,3 +422,82 @@ fn start_line_zero_on_a_genuinely_empty_session_still_fails() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("nothing to digest"));
 }
+
+fn run_toon(text: &str, json: bool) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_squishi"));
+    cmd.arg("--toon");
+    if json {
+        cmd.arg("--json");
+    }
+    cmd.arg(text)
+        .output()
+        .expect("failed to run squishi binary")
+}
+
+#[test]
+fn toon_encodes_a_uniform_array_through_the_real_binary() {
+    let output = run_toon(r#"[{"id":1,"name":"a"},{"id":2,"name":"b"}]"#, false);
+    assert!(output.status.success(), "{:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "[2]{id,name}:\n  1,a\n  2,b");
+}
+
+#[test]
+fn toon_json_mode_reports_the_governator_contract() {
+    let output = run_toon(r#"[{"id":1,"name":"a"},{"id":2,"name":"b"}]"#, true);
+    assert!(output.status.success(), "{:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(value["source"], "toon");
+    assert!(value["chars_after"].as_u64().unwrap() < value["chars_before"].as_u64().unwrap());
+}
+
+#[test]
+fn toon_falls_back_to_original_json_when_not_smaller() {
+    let output = run_toon("5", true);
+    assert!(output.status.success(), "{:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(value["source"], "toon-not-smaller");
+    assert_eq!(value["compressed"], "5");
+}
+
+#[test]
+fn toon_rejects_non_json_input_with_a_clear_error() {
+    let output = run_toon("not json at all", false);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("requires valid JSON"));
+}
+
+/// The real end-to-end proof: whatever `--toon` actually decided for
+/// genuinely messy real production data (graphify's own graph.json,
+/// confirmed non-uniform -- 3 distinct field shapes across 164 nodes,
+/// one node is even missing `_origin`), the result recovers the exact
+/// original value. Doesn't assume TOON wins here -- it may honestly
+/// decline (`toon-not-smaller`) for data this irregular, and the test
+/// checks whichever path was actually taken, not a guessed one.
+#[test]
+fn toon_round_trips_real_graph_json_through_the_binary() {
+    let graph_json = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/graphify-out/graph.json"
+    ))
+    .unwrap();
+    let graph: serde_json::Value = serde_json::from_str(&graph_json).unwrap();
+    let nodes = graph.get("nodes").unwrap();
+    let nodes_json = serde_json::to_string(nodes).unwrap();
+
+    let output = run_toon(&nodes_json, true);
+    assert!(output.status.success(), "{:?}", output);
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    let compressed = value["compressed"].as_str().unwrap();
+
+    let recovered = if value["source"] == "toon" {
+        squishi::toon::decode(compressed).unwrap()
+    } else {
+        // toon-not-smaller: `compressed` is the original JSON verbatim.
+        serde_json::from_str(compressed).unwrap()
+    };
+    assert_eq!(&recovered, nodes);
+}
