@@ -48,10 +48,12 @@
 //! smaller-capacity architecture swap (`ldenoue/distilbert-punctuator`,
 //! evaluated and rejected the same day) did not.
 
+use crate::stage_timing::StageTimings;
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::xlm_roberta::{Config as XlmRobertaConfig, XLMRobertaModel};
 use hf_hub::api::sync::Api;
+use std::time::Instant;
 use tokenizers::Tokenizer;
 
 const MODEL_REPO: &str = "oliverguhr/fullstop-punctuation-multilingual-base";
@@ -87,6 +89,11 @@ pub struct PunctuationRestorer {
     tokenizer: Tokenizer,
     device: Device,
     pad_id: u32,
+    /// Per-stage timing accumulated across `restore_batch` calls within
+    /// the current `restore()` — see `stage_timing.rs`'s own doc comment.
+    /// Reset at the start of each `restore()` call, so a fresh call's
+    /// numbers never include a previous call's time.
+    stage_timings: StageTimings,
 }
 
 impl PunctuationRestorer {
@@ -140,6 +147,7 @@ impl PunctuationRestorer {
             tokenizer,
             device,
             pad_id,
+            stage_timings: StageTimings::default(),
         })
     }
 
@@ -154,6 +162,7 @@ impl PunctuationRestorer {
     /// reference `punctuators` package), acceptable for a real-but-not-
     /// perfect improvement over the word-window fallback it replaces.
     pub fn restore(&mut self, content: &str) -> Result<String, String> {
+        self.stage_timings = StageTimings::default();
         let words: Vec<&str> = content.split_whitespace().collect();
         if words.is_empty() {
             return Ok(String::new());
@@ -171,6 +180,13 @@ impl PunctuationRestorer {
         Ok(restored_chunks.join(" "))
     }
 
+    /// Per-stage timing summed across every `restore_batch` call made
+    /// during the most recent `restore()` — see `stage_timing.rs`. Only
+    /// read by the timing examples; not part of the production contract.
+    pub fn stage_timings(&self) -> &StageTimings {
+        &self.stage_timings
+    }
+
     /// Runs one or more chunks through a single model forward pass,
     /// padded to the batch's own longest chunk (not the model's 514
     /// ceiling — real waste reduction when most chunks in a batch are
@@ -181,12 +197,15 @@ impl PunctuationRestorer {
     /// `None` — padding-awareness falls out of code that already
     /// existed for the single-chunk case, not new filtering logic.
     fn restore_batch(&mut self, chunks: &[String]) -> Result<Vec<String>, String> {
+        let tokenize_start = Instant::now();
         let encodings: Vec<_> = chunks
             .iter()
             .map(|c| self.tokenizer.encode(c.as_str(), true))
             .collect::<Result<_, _>>()
             .map_err(|e| e.to_string())?;
+        self.stage_timings.tokenize += tokenize_start.elapsed();
 
+        let build_tensors_start = Instant::now();
         let max_len = encodings
             .iter()
             .map(|e| e.get_ids().len())
@@ -212,7 +231,9 @@ impl PunctuationRestorer {
             .map_err(|e| e.to_string())?;
         let token_type_ids = Tensor::zeros((batch_size, max_len), DType::U32, &self.device)
             .map_err(|e| e.to_string())?;
+        self.stage_timings.build_tensors += build_tensors_start.elapsed();
 
+        let forward_start = Instant::now();
         let hidden = self
             .model
             .forward(
@@ -228,7 +249,9 @@ impl PunctuationRestorer {
             .broadcast_matmul(&self.classifier_weight.t().map_err(|e| e.to_string())?)
             .and_then(|l| l.broadcast_add(&self.classifier_bias))
             .map_err(|e| e.to_string())?;
+        self.stage_timings.forward += forward_start.elapsed();
 
+        let postprocess_start = Instant::now();
         let mut results = Vec::with_capacity(batch_size);
         for (row, (chunk, encoding)) in chunks.iter().zip(encodings.iter()).enumerate() {
             let row_len = encoding.get_ids().len();
@@ -270,6 +293,7 @@ impl PunctuationRestorer {
             results.push(reconstruct(chunk, &word_label));
         }
 
+        self.stage_timings.postprocess += postprocess_start.elapsed();
         Ok(results)
     }
 }

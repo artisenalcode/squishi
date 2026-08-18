@@ -2,6 +2,13 @@
 //! real file's content, print load time / restore time / word and
 //! chunk counts. Used to baseline the current large model against a
 //! real Hormozi transcript before evaluating a smaller replacement.
+//!
+//! **2026-08-19: extended with per-stage timing** (tokenize / build
+//! input tensors / model forward / postprocess), per
+//! docs/ideation/ort-dependency-consistency/
+//! 2026-08-19-candle-cpu-profiling-plan.md's Step 1 — the aggregate
+//! "restore time" alone can't distinguish candle's own inference cost
+//! from tokenization/padding overhead around it.
 
 use squishi::punctuation_restore::PunctuationRestorer;
 use std::env;
@@ -38,6 +45,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "words/sec: {:.1}",
         word_count as f64 / elapsed.as_secs_f64()
     );
+
+    let stages = restorer.stage_timings();
+    println!("\n--- per-stage breakdown (summed across all batches) ---");
+    println!("tokenize:      {:?}", stages.tokenize);
+    println!("build_tensors: {:?}", stages.build_tensors);
+    println!("forward:       {:?}", stages.forward);
+    println!("postprocess:   {:?}", stages.postprocess);
+    println!(
+        "stage total:   {:?} ({:.1}% of restore time)",
+        stages.total(),
+        100.0 * stages.total().as_secs_f64() / elapsed.as_secs_f64()
+    );
+
     println!("\n--- first 500 chars of restored output ---");
     println!("{}", &restored[..restored.len().min(500)]);
 

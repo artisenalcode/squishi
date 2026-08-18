@@ -39,12 +39,14 @@
 //! unchanged (this module's own dedup/summary logic depends on exactly
 //! this contract, not on how the embedding was actually computed).
 
+use crate::stage_timing::StageTimings;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
 use hf_hub::api::sync::Api;
 use regex::Regex;
 use std::sync::LazyLock;
+use std::time::Instant;
 use tokenizers::Tokenizer;
 
 const MODEL_REPO: &str = "sentence-transformers/all-MiniLM-L6-v2";
@@ -187,6 +189,10 @@ pub struct SemanticDedup {
     /// model shouldn't be paid for unconditionally on every `dedupe()`.
     punctuation_restorer: Option<crate::punctuation_restore::PunctuationRestorer>,
     punctuation_load_attempted: bool,
+    /// Per-stage timing accumulated across `embed_batch` calls within
+    /// the current `dedupe()` — see `stage_timing.rs`'s own doc comment.
+    /// Reset at the start of each `dedupe()` call.
+    stage_timings: StageTimings,
 }
 
 /// Deterministic, regex-based — same heuristic style as
@@ -306,6 +312,7 @@ impl SemanticDedup {
             device,
             punctuation_restorer: None,
             punctuation_load_attempted: false,
+            stage_timings: StageTimings::default(),
         })
     }
 
@@ -329,6 +336,7 @@ impl SemanticDedup {
         threshold: f32,
         allow_punctuation_restore: bool,
     ) -> Result<DedupResult, String> {
+        self.stage_timings = StageTimings::default();
         let content = content.trim();
 
         // Try real punctuation restoration first when the input needs
@@ -435,6 +443,13 @@ impl SemanticDedup {
         })
     }
 
+    /// Per-stage timing summed across every `embed_batch` call made
+    /// during the most recent `dedupe()` — see `stage_timing.rs`. Only
+    /// read by the timing examples; not part of the production contract.
+    pub fn stage_timings(&self) -> &StageTimings {
+        &self.stage_timings
+    }
+
     /// Lazily loads the punctuation-restoration model on first need —
     /// most `dedupe()` calls never hit unpunctuated input, so its
     /// ~562MB shouldn't be paid unconditionally. Cached on `self` for
@@ -475,6 +490,7 @@ impl SemanticDedup {
             return Ok(Vec::new());
         }
 
+        let tokenize_start = Instant::now();
         self.tokenizer
             .with_padding(Some(tokenizers::PaddingParams::default()));
         let encode_result = self
@@ -483,7 +499,9 @@ impl SemanticDedup {
             .map_err(|e| e.to_string());
         self.tokenizer.with_padding(None);
         let encodings = encode_result?;
+        self.stage_timings.tokenize += tokenize_start.elapsed();
 
+        let build_tensors_start = Instant::now();
         let batch_size = encodings.len();
         let seq_len = encodings[0].get_ids().len();
 
@@ -502,7 +520,9 @@ impl SemanticDedup {
             .map_err(|e| e.to_string())?;
         let token_type_ids = Tensor::from_vec(type_ids, (batch_size, seq_len), &self.device)
             .map_err(|e| e.to_string())?;
+        self.stage_timings.build_tensors += build_tensors_start.elapsed();
 
+        let forward_start = Instant::now();
         let hidden = self
             .model
             .forward(&input_ids, &token_type_ids, Some(&attention_mask))
@@ -513,7 +533,9 @@ impl SemanticDedup {
             .to_vec1()
             .map_err(|e| e.to_string())?;
         let hidden = hidden.as_slice();
+        self.stage_timings.forward += forward_start.elapsed();
 
+        let postprocess_start = Instant::now();
         let mut result = Vec::with_capacity(batch_size);
         for b in 0..batch_size {
             let mut pooled = vec![0f32; EMBEDDING_DIM];
@@ -542,6 +564,7 @@ impl SemanticDedup {
             }
             result.push(pooled);
         }
+        self.stage_timings.postprocess += postprocess_start.elapsed();
 
         Ok(result)
     }
