@@ -501,3 +501,34 @@ fn toon_round_trips_real_graph_json_through_the_binary() {
     };
     assert_eq!(&recovered, nodes);
 }
+
+#[test]
+fn generate_man_writes_a_real_man_page_and_leaves_no_other_output() {
+    let out_dir = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_squishi"))
+        .arg("--generate-man")
+        .arg(out_dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{:?}", output);
+
+    let man_path = out_dir.path().join("squishi.1");
+    let contents = std::fs::read_to_string(&man_path).unwrap();
+    // Real roff(7) man page markers, not just "some file got written" --
+    // roff escapes hyphens as `\-`, so a documented flag reads `\-\-toon`.
+    assert!(
+        contents.contains(".TH squishi"),
+        "missing .TH header: {contents}"
+    );
+    assert!(
+        contents.contains("\\-\\-toon"),
+        "missing a real documented flag: {contents}"
+    );
+    // --generate-man itself is a hidden dev-only flag -- must not appear
+    // in the user-facing man page it produces.
+    assert!(
+        !contents.contains("generate\\-man"),
+        "hidden flag leaked into its own output"
+    );
+}

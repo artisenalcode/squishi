@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use serde_json::{Map, Value};
 use squishi::base64_strip::strip_base64_blobs;
 use squishi::content_detect::{ContentKind, detect};
@@ -142,6 +142,15 @@ struct Cli {
     /// `--session-prune`/`--session-digest` (out of scope for this flag).
     #[arg(long, value_enum, default_value_t = Level::Default)]
     level: Level,
+
+    /// Write a real roff(7) man page (squishi.1) to this directory instead
+    /// of compressing `text` (ignored when set). Same "flag not
+    /// subcommand" reasoning as --doctor. Regenerated from this exact
+    /// `Cli` definition via `clap_mangen` — every flag's doc comment above
+    /// becomes the man page's OPTIONS text, so the two can never drift the
+    /// way a hand-maintained man page would.
+    #[arg(long, value_name = "OUT_DIR", hide = true)]
+    generate_man: Option<std::path::PathBuf>,
 
     /// Encode `text` (must be valid JSON) as TOON instead of running the
     /// normal detect+compress pipeline — same "flag not subcommand"
@@ -649,6 +658,21 @@ fn read_input(cli: &Cli) -> Result<String, String> {
 
 fn main() {
     let cli = Cli::parse();
+
+    if let Some(out_dir) = &cli.generate_man {
+        if let Err(e) = std::fs::create_dir_all(out_dir) {
+            eprintln!("squishi --generate-man: failed to create {out_dir:?}: {e}");
+            std::process::exit(1);
+        }
+        match clap_mangen::Man::new(Cli::command()).generate_to(out_dir) {
+            Ok(path) => println!("wrote {}", path.display()),
+            Err(e) => {
+                eprintln!("squishi --generate-man: failed to write man page: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
 
     if cli.doctor {
         let report = doctor::run(cli.quick);
