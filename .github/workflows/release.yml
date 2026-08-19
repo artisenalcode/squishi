@@ -99,23 +99,42 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             archive_ext: tar.gz
+            protoc_asset: linux-x86_64
           - target: aarch64-apple-darwin
             os: macos-14
             archive_ext: tar.gz
+            protoc_asset: osx-aarch_64
           - target: x86_64-apple-darwin
             os: macos-13
             archive_ext: tar.gz
+            protoc_asset: osx-x86_64
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             archive_ext: zip
+            protoc_asset: win64
     runs-on: ${{ matrix.os }}
+    env:
+      PROTOC_VERSION: "35.1"
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.bump-version.outputs.tag }}
-      - uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install protoc (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          curl -sSL -o protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${{ matrix.protoc_asset }}.zip"
+          mkdir -p "$HOME/.local/protoc"
+          unzip -q protoc.zip -d "$HOME/.local/protoc"
+          chmod +x "$HOME/.local/protoc/bin/protoc"
+          echo "$HOME/.local/protoc/bin" >> "$GITHUB_PATH"
+      - name: Install protoc (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v$env:PROTOC_VERSION/protoc-$env:PROTOC_VERSION-${{ matrix.protoc_asset }}.zip" -OutFile protoc.zip
+          Expand-Archive -Path protoc.zip -DestinationPath "$env:USERPROFILE\protoc"
+          echo "$env:USERPROFILE\protoc\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}

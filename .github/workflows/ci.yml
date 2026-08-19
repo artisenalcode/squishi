@@ -13,7 +13,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install protoc
+        env:
+          PROTOC_VERSION: "35.1"
+        run: |
+          curl -sSL -o protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          mkdir -p "$HOME/.local/protoc"
+          unzip -q protoc.zip -d "$HOME/.local/protoc"
+          chmod +x "$HOME/.local/protoc/bin/protoc"
+          echo "$HOME/.local/protoc/bin" >> "$GITHUB_PATH"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy, llvm-tools-preview
