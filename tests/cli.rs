@@ -478,14 +478,11 @@ fn toon_rejects_non_json_input_with_a_clear_error() {
 /// checks whichever path was actually taken, not a guessed one.
 #[test]
 fn toon_round_trips_real_graph_json_through_the_binary() {
-    let graph_json = std::fs::read_to_string(concat!(
+    let nodes_json = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/graphify-out/graph.json"
+        "/tests/fixtures/graph_nodes.json"
     ))
     .unwrap();
-    let graph: serde_json::Value = serde_json::from_str(&graph_json).unwrap();
-    let nodes = graph.get("nodes").unwrap();
-    let nodes_json = serde_json::to_string(nodes).unwrap();
 
     let output = run_toon(&nodes_json, true);
     assert!(output.status.success(), "{:?}", output);
@@ -499,7 +496,8 @@ fn toon_round_trips_real_graph_json_through_the_binary() {
         // toon-not-smaller: `compressed` is the original JSON verbatim.
         serde_json::from_str(compressed).unwrap()
     };
-    assert_eq!(&recovered, nodes);
+    let nodes: serde_json::Value = serde_json::from_str(&nodes_json).unwrap();
+    assert_eq!(recovered, nodes);
 }
 
 #[test]

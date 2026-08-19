@@ -906,10 +906,13 @@ mod tests {
     /// trips exactly.
     #[test]
     fn round_trips_graphify_s_real_graph_json_nodes() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/graphify-out/graph.json");
-        let raw = std::fs::read_to_string(path).expect("graphify-out/graph.json must exist");
-        let graph: Value = serde_json::from_str(&raw).unwrap();
-        let nodes = graph.get("nodes").unwrap().clone();
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/graph_nodes.json"
+        );
+        let raw =
+            std::fs::read_to_string(path).expect("tests/fixtures/graph_nodes.json must exist");
+        let nodes: Value = serde_json::from_str(&raw).unwrap();
 
         let toon = encode(&nodes);
         let decoded = decode(&toon).unwrap();
