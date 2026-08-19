@@ -1,51 +1,13 @@
-//! Outlier detectors used to mark items as "must preserve" during
-//! compression. Ported from headroom's `smart_crusher/outliers.rs`,
-//! including its Bug #3 fix (see below) — the fix was already applied
-//! upstream before this port, so this is the corrected algorithm, not
-//! the naive cardinality cap.
+//! Outlier detectors used to mark items as "must preserve" during compression.
 //!
-//! # Bug #3 fix — `detect_rare_status_values`
-//!
-//! A naive cardinality cap of 10 skips error-code domains with 50+
-//! codes entirely, even when one or two codes appear at <1% rates and
-//! clearly deserve outlier flagging. The fix replaces the cap-and-
-//! dominance approach with a Pareto check:
-//!
-//! 1. Cardinality cap raised to **50** (above which the field is
-//!    almost certainly an ID/free-form column, not a status enum).
-//! 2. Sort value frequencies descending. Find the smallest K such
-//!    that the top-K values cover ≥80% of items.
-//! 3. If `K ≤ 5`, the remaining values are "rare" and items
-//!    containing them are outliers.
-//!
-//! This unifies both cases the naive algorithm partially handled:
-//!
-//! - **Low cardinality + dominant**: 95×"ok" + 5 errors → top-1 covers
-//!   95% → 4 rare values flagged. Same as before.
-//! - **Higher cardinality + bimodal**: 60×"info" + 25×"warn" + 15
-//!   distinct rare errors → top-2 covers 85% → 15 rare values flagged.
-//!   New, correct, and missed entirely by the naive cap.
-//! - **Uniform distribution**: 50 distinct values, 2 each → top-K
-//!   never reaches 80% with K ≤ 5 → skip. Correctly identifies as
-//!   non-categorical.
+//! `detect_rare_status_values` uses a Pareto check instead of a naive cardinality cap: cardinality 2..=50, sort value frequencies descending, find the smallest K where top-K covers ≥80% of items, and if `K ≤ 5` the remaining values are "rare". This catches both a dominant-value case (95×"ok" + 5 errors) and a higher-cardinality bimodal case (60×"info" + 25×"warn" + 15 distinct rare errors) that a plain cardinality-10 cap would skip entirely, while a uniform 50-distinct-values field correctly never reaches 80% at K≤5 and is left alone.
 
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::error_keywords::ERROR_KEYWORDS;
 
-/// Detect items that are structural outliers (error-like or
-/// uncommonly-shaped).
-///
-/// Returns deduplicated, ascending-sorted indices.
-///
-/// # Detection
-///
-/// 1. **Rare-field outliers**: items containing a field that appears
-///    in <20% of the array.
-/// 2. **Rare-status outliers**: forwarded to `detect_rare_status_values`,
-///    which finds items with statistically rare categorical values
-///    (with bug #3 fixed).
+/// Detects structural outliers (error-like or uncommonly-shaped items), returning deduplicated ascending indices: items with a field appearing in <20% of the array, plus whatever `detect_rare_status_values` finds.
 pub fn detect_structural_outliers(items: &[Value]) -> Vec<usize> {
     if items.len() < 5 {
         return Vec::new();
@@ -95,16 +57,7 @@ pub fn detect_structural_outliers(items: &[Value]) -> Vec<usize> {
     outlier_set.into_iter().collect()
 }
 
-/// Detect items with rare values in status-like categorical fields.
-///
-/// **Bug #3 fix** — see module-level doc. Algorithm:
-///
-/// 1. Cardinality 2..=50.
-/// 2. Pareto check: top-K values covering ≥80% with `K ≤ 5`.
-/// 3. Items NOT in top-K → outliers.
-///
-/// Returns indices in discovery order; the caller (`detect_structural_
-/// outliers`) dedupes via `BTreeSet`.
+/// Detects items with rare values in status-like categorical fields -- see module doc for the Pareto algorithm. Returns indices in discovery order; the caller dedupes via `BTreeSet`.
 pub fn detect_rare_status_values(items: &[Value], common_fields: &HashSet<String>) -> Vec<usize> {
     let mut outlier_indices: Vec<usize> = Vec::new();
 
@@ -200,14 +153,7 @@ pub fn detect_rare_status_values(items: &[Value], common_fields: &HashSet<String
     outlier_indices
 }
 
-/// Detect items containing error keywords for preservation. Used to
-/// ensure error items are never dropped by row-selection.
-///
-/// - `items`: array items to scan.
-/// - `item_strings`: pre-computed JSON serializations to avoid
-///   redundant `to_string` work. Pass `None` to serialize on the fly.
-///   When provided, an index past the end of `item_strings` falls back
-///   to fresh serialization for that item.
+/// Detects items containing error keywords, so they're never dropped by row-selection. `item_strings` is optional pre-computed JSON serialization to skip redundant `to_string` work; an index past its end falls back to fresh serialization.
 pub fn detect_error_items_for_preservation(
     items: &[Value],
     item_strings: Option<&[String]>,
@@ -250,8 +196,7 @@ mod tests {
 
     #[test]
     fn outliers_rare_field_flags_item() {
-        // 9 items with `{"a"}`, 1 item with extra `{"a", "x"}` — `x`
-        // appears in 10% of items, below the 20% rare-field threshold.
+        // `x` appears in 10% of items, below the 20% rare-field threshold.
         let mut items: Vec<Value> = (0..9).map(|i| json!({"a": i})).collect();
         items.push(json!({"a": 9, "x": "rare"}));
         let outliers = detect_structural_outliers(&items);
@@ -260,8 +205,6 @@ mod tests {
 
     #[test]
     fn outliers_no_dict_items_silently_skipped() {
-        // Mixed array: only dict items count. A non-dict in the middle
-        // doesn't crash anything.
         let items: Vec<Value> = vec![
             json!({"status": "ok"}),
             json!("string-not-dict"),
@@ -269,7 +212,7 @@ mod tests {
             json!({"status": "ok"}),
             json!({"status": "ok"}),
         ];
-        // Should not panic.
+        // A non-dict item in the middle must not panic.
         let _ = detect_structural_outliers(&items);
     }
 
@@ -292,9 +235,7 @@ mod tests {
 
     #[test]
     fn rare_status_bug3_fix_high_cardinality_bimodal() {
-        // BUG #3 case: cardinality 17 (1 dominant + 1 second + 15
-        // singletons). Naive cap: 17 > 10 → skip. Fixed: top-2 covers
-        // 85%, K=2 ≤ 5, remaining 15 values flagged.
+        // Cardinality 17: a naive cap of 10 would skip it. Top-2 covers 85% (K=2 ≤ 5), so the remaining 15 values are flagged.
         let mut items: Vec<Value> = Vec::new();
         for _ in 0..60 {
             items.push(json!({"code": "INFO"}));
@@ -307,15 +248,12 @@ mod tests {
         }
         let common: HashSet<String> = ["code".to_string()].into_iter().collect();
         let outliers = detect_rare_status_values(&items, &common);
-        // 15 rare-error items flagged. Pre-fix this would be 0.
         assert_eq!(outliers.len(), 15);
     }
 
     #[test]
     fn rare_status_uniform_distribution_no_outliers() {
-        // 50 items, 50 distinct values, 1 each. Top-K never reaches
-        // 80% with K ≤ 5 → no outliers (correctly identified as
-        // non-categorical).
+        // 50 distinct values, 1 each -- top-K never reaches 80% with K ≤ 5, correctly identified as non-categorical.
         let items: Vec<Value> = (0..50)
             .map(|i| json!({"code": format!("CAT_{}", i)}))
             .collect();
@@ -329,7 +267,7 @@ mod tests {
 
     #[test]
     fn rare_status_cardinality_above_50_skipped() {
-        // 60 distinct values → cardinality cap rejects.
+        // 60 distinct values -- cardinality cap rejects.
         let items: Vec<Value> = (0..60)
             .map(|i| json!({"code": format!("V_{}", i)}))
             .collect();
@@ -340,7 +278,7 @@ mod tests {
 
     #[test]
     fn rare_status_cardinality_one_skipped() {
-        // 100 items, all same value → cardinality 1, fails 2..=50 gate.
+        // All same value -- cardinality 1, fails the 2..=50 gate.
         let items: Vec<Value> = (0..100).map(|_| json!({"status": "ok"})).collect();
         let common: HashSet<String> = ["status".to_string()].into_iter().collect();
         let outliers = detect_rare_status_values(&items, &common);
@@ -349,9 +287,7 @@ mod tests {
 
     #[test]
     fn rare_status_nulls_filtered_from_cardinality() {
-        // `unique_values` excludes nulls. With 95×"ok" + 5×null,
-        // cardinality = 1 (just "ok"), which fails the 2..=50 gate and
-        // the field is skipped entirely.
+        // `unique_values` excludes nulls -- 95×"ok" + 5×null is cardinality 1, fails the 2..=50 gate.
         let mut items: Vec<Value> = (0..95).map(|_| json!({"s": "ok"})).collect();
         for _ in 0..5 {
             items.push(json!({"s": null}));
@@ -366,14 +302,7 @@ mod tests {
 
     #[test]
     fn rare_status_nulls_count_in_value_counts_when_cardinality_passes() {
-        // Once cardinality >= 2 (with nulls excluded from the set), the
-        // value_counts loop maps null → "__none__" and treats it as a
-        // distinct value for frequency counting.
-        //
-        // Setup: 90×"ok" + 5×"warn" + 5×null → unique_values = {"ok", "warn"},
-        // cardinality 2, gate passes. value_counts: ok=90, warn=5,
-        // __none__=5. top-1 = "ok" (90/100 = 90%) covers ≥80%, K=1 ≤ 5.
-        // Items with "warn" or null are flagged.
+        // 90×"ok" + 5×"warn" + 5×null: cardinality 2 (nulls excluded from the set) passes the gate; null then counts as "__none__" for frequency. top-1 "ok" covers 90% (K=1 ≤ 5), so "warn" and null are flagged.
         let mut items: Vec<Value> = (0..90).map(|_| json!({"s": "ok"})).collect();
         for _ in 0..5 {
             items.push(json!({"s": "warn"}));
@@ -420,9 +349,7 @@ mod tests {
 
     #[test]
     fn error_keywords_uses_cached_strings_when_provided() {
-        // If `item_strings` is passed, we use those rather than
-        // re-serializing. Test that a custom cached string can drive
-        // a hit even when the actual item wouldn't.
+        // A custom cached string can drive a hit even when the actual item wouldn't.
         let items: Vec<Value> = vec![json!({"a": 1}), json!({"b": 2})];
         let cached = vec!["error".to_string(), "ok".to_string()];
         let errs = detect_error_items_for_preservation(&items, Some(&cached));

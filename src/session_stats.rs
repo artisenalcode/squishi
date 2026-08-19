@@ -1,17 +1,6 @@
-//! Session-level stats aggregator: scans a Claude Code transcript for
-//! squishi's own `--json` invocations and reports cumulative real savings
-//! (chars_before/chars_after), broken down per content `kind`.
+//! Session-level stats aggregator: scans a Claude Code transcript for squishi's own `--json` invocations and reports cumulative real savings, broken down per content `kind`.
 //!
-//! `session_prune::parse`'s `ToolUseItem.path` only captures Read/Write/
-//! Edit's `input.file_path` — a squishi call made via Bash carries no
-//! structured path/command field there, so identifying "which tool calls
-//! were squishi" by tool name or command text isn't reliable. Instead
-//! this matches `ToolResultItem.content` against squishi's own known
-//! `--json` output contract (`compressed`/`kind`/`source`/`chars_before`/
-//! `chars_after` — see `main.rs`'s `build_output`): invocation-method-
-//! agnostic, and a false-positive match would need another tool to
-//! independently produce all five keys with those exact names, which
-//! nothing else in a real transcript does.
+//! Identifies squishi calls by matching `ToolResultItem.content` against squishi's known `--json` output contract (`compressed`/`kind`/`source`/`chars_before`/`chars_after`), not by tool name or command text -- a Bash-invoked squishi call carries no structured path field to key on otherwise.
 
 use crate::session_prune::{self, SessionItem};
 use serde_json::Value;
@@ -37,8 +26,7 @@ impl KindStats {
         self.chars_before.saturating_sub(self.chars_after)
     }
 
-    /// `0.0` when `chars_before` is `0` (nothing to save a percentage of),
-    /// not a division-by-zero panic or `NaN`.
+    /// `0.0` when `chars_before` is `0`, not a division-by-zero panic or `NaN`.
     pub fn pct_saved(&self) -> f64 {
         if self.chars_before == 0 {
             0.0
@@ -54,11 +42,7 @@ pub struct SessionStats {
     pub total: KindStats,
 }
 
-/// Scans `jsonl` (a full or partial Claude Code transcript) and
-/// aggregates every squishi `--json` call found in it. Anything that
-/// doesn't parse as JSON, or parses but is missing one of the five
-/// contract keys, is silently skipped — same "transcript shape isn't a
-/// versioned contract, be defensive" posture `session_prune::parse` uses.
+/// Scans `jsonl` and aggregates every squishi `--json` call found. Anything that doesn't parse as JSON, or is missing one of the five contract keys, is silently skipped.
 pub fn scan(jsonl: &str) -> SessionStats {
     let items = session_prune::parse(jsonl);
     let mut stats = SessionStats::default();
@@ -159,8 +143,7 @@ mod tests {
 
     #[test]
     fn skips_a_non_squishi_tool_result() {
-        // A real Read tool result: plain file content, not squishi's
-        // 5-key JSON contract — must not be miscounted.
+        // Plain file content, not squishi's 5-key JSON contract -- must not be miscounted.
         let jsonl = [
             tool_result_line("t1", "fn main() {\n    println!(\"hi\");\n}\n"),
             tool_result_line("t2", &squishi_json("Diff", 800, 400)),
@@ -176,8 +159,7 @@ mod tests {
 
     #[test]
     fn skips_json_missing_a_required_key() {
-        // Real squishi output missing chars_after would mean a
-        // contract regression elsewhere — never silently half-count it.
+        // Missing chars_after would mean a contract regression elsewhere -- never silently half-count it.
         let partial = serde_json::json!({
             "compressed": "...",
             "kind": "Json",

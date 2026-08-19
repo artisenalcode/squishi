@@ -1,13 +1,4 @@
-//! Minimal per-stage duration accumulator. Used only by the timing
-//! examples (`examples/time_punctuation.rs`, `examples/time_embedding.rs`,
-//! per docs/ideation/ort-dependency-consistency/
-//! 2026-08-19-candle-cpu-profiling-plan.md's Step 1) to split a model
-//! call's wall time into its real sub-stages — tokenize / build input
-//! tensors / model forward pass / postprocess — instead of one lumped
-//! aggregate number. Production callers of `PunctuationRestorer`/
-//! `SemanticDedup` never read this; the bookkeeping is a handful of
-//! `Instant::now()` calls and `Duration` additions per batch, not a
-//! meaningful cost added to the real hot path.
+//! Minimal per-stage duration accumulator, used only by the timing examples to split a model call's wall time into sub-stages (tokenize / build tensors / forward pass / postprocess) instead of one lumped number. Production callers never read this.
 
 use std::time::Duration;
 
@@ -20,11 +11,7 @@ pub struct StageTimings {
 }
 
 impl StageTimings {
-    /// Adds another batch's stage durations into this total. Callers
-    /// reset to `default()` once per top-level call (`restore()`/
-    /// `dedupe()`), then accumulate each internal batch's timings so a
-    /// chunked/multi-batch input reports one real summed total per
-    /// stage, not just the last batch measured.
+    /// Adds another batch's stage durations into this total. Callers reset to `default()` once per top-level call, then accumulate each batch so a chunked input reports one summed total per stage.
     pub fn accumulate(&mut self, other: &StageTimings) {
         self.tokenize += other.tokenize;
         self.build_tensors += other.build_tensors;

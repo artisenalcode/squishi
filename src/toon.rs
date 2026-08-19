@@ -1,26 +1,8 @@
-//! TOON (Token-Oriented Object Notation) encoder/decoder — a real, public,
-//! MIT-licensed format (github.com/toon-format/spec, SPEC v4.1), not
-//! reverse-engineered from caveman. Implements the comma-delimiter,
-//! 2-space-indent core of the spec: scalar encoding (quoting/escaping,
-//! canonical numbers, true/false/null), object encoding, the primitive-
-//! array inline form, the tabular form for uniform arrays of
-//! flat-primitive-field objects, and the list-item fallback form for
-//! everything else (mixed-type arrays, non-uniform objects, objects with
-//! nested-object fields).
+//! TOON (Token-Oriented Object Notation) encoder/decoder — a real, public, MIT-licensed format (github.com/toon-format/spec, SPEC v4.1). Implements the comma-delimiter, 2-space-indent core: scalar encoding, object encoding, the primitive-array inline form, the tabular form for uniform arrays of flat-primitive-field objects, and the list-item fallback for everything else.
 //!
-//! Deliberately NOT implemented for v1 (documented here, not silently
-//! skipped): nested field-group folding in tabular headers (`field{a,b}`
-//! collapsing into the header for uniform nested objects), the keyed-
-//! tabular object-of-objects form (`[N:]`), tab/pipe delimiters, and
-//! exponent notation for numbers outside the canonical range. All of
-//! these degrade to a real, valid, still-correct (just less maximally
-//! compact) form instead of failing — see `format_number` and the list
-//! fallback in `encode_array`.
+//! Not implemented for v1: nested field-group folding in tabular headers, the keyed-tabular object-of-objects form (`[N:]`), tab/pipe delimiters, exponent notation outside the canonical range. All degrade to a valid, correct, just less maximally compact form (see `format_number` and the list fallback in `encode_array`).
 //!
-//! Unlike every other compressor in this crate, TOON is LOSSLESS: `decode`
-//! of an `encode` output reproduces the exact same `serde_json::Value` —
-//! no CCR recovery handle needed. See
-//! docs/ideation/squishi-toon-pixel/2026-08-18-toon-and-pixel-mode-spec.md.
+//! Unlike every other compressor in this crate, TOON is lossless: `decode(encode(x))` reproduces the exact same `serde_json::Value`, no CCR recovery handle needed.
 
 use regex::Regex;
 use serde_json::{Map, Number, Value};
@@ -54,13 +36,7 @@ pub fn encode(value: &Value) -> String {
     }
 }
 
-/// Encode `value` as TOON, but only if the result actually measures
-/// smaller (in bytes) than `value`'s own compact JSON form. `None` means
-/// TOON didn't help for this shape -- same "never ship a result that
-/// isn't actually smaller" discipline every compressor in this crate
-/// already follows (json_compress's dedup, log_compress's line
-/// selection, ...). Since TOON is lossless, a `None` here costs nothing:
-/// the caller just keeps the original JSON, no fallback machinery needed.
+/// Encode `value` as TOON, but only if it measures smaller than `value`'s compact JSON form. `None` costs nothing since TOON is lossless -- the caller just keeps the original JSON.
 pub fn encode_if_smaller(value: &Value) -> Option<String> {
     let json_len = serde_json::to_string(value).ok()?.len();
     let toon = encode(value);
@@ -98,10 +74,7 @@ fn encode_object_fields(map: &Map<String, Value>, indent: usize) -> Vec<String> 
     lines
 }
 
-/// Dispatches an array to whichever real TOON form applies: inline
-/// primitive form, tabular form (uniform flat-object rows), or the list
-/// fallback. `key` is `None` at root (array position), `Some(name)` when
-/// this array is an object field.
+/// Dispatches an array to whichever TOON form applies: inline primitive, tabular (uniform flat-object rows), or list fallback. `key` is `None` at root, `Some(name)` for an object field.
 fn encode_array(items: &[Value], indent: usize, key: Option<&str>) -> Vec<String> {
     let pad = INDENT.repeat(indent);
     let n = items.len();
@@ -136,9 +109,7 @@ fn encode_array(items: &[Value], indent: usize, key: Option<&str>) -> Vec<String
         return vec![format!("{pad}{prefix}[{n}]: {}", values.join(","))];
     }
 
-    // List-item fallback: real, valid, lossless -- just not the maximally
-    // compact tabular form. Covers mixed-type arrays, non-uniform arrays
-    // of objects, and arrays containing nested arrays/objects.
+    // List-item fallback: valid and lossless, just not maximally compact. Covers mixed-type and non-uniform arrays.
     let mut lines = vec![format!("{pad}{prefix}[{n}]:")];
     let item_pad = INDENT.repeat(indent + 1);
     for item in items {
@@ -147,10 +118,7 @@ fn encode_array(items: &[Value], indent: usize, key: Option<&str>) -> Vec<String
     lines
 }
 
-/// One `- ...` list entry, per §10: an object's first field (in encounter
-/// order) goes directly on the hyphen line, remaining fields indent under
-/// it; a scalar goes directly on the hyphen line; an array gets its own
-/// header on the hyphen line with items nested one level deeper.
+/// One `- ...` list entry, per §10: an object's first field goes on the hyphen line, remaining fields indent under it; a scalar goes directly on the hyphen line; an array gets its own header with items nested one level deeper.
 fn encode_list_item(item: &Value, indent: usize, item_pad: &str) -> Vec<String> {
     match item {
         Value::Object(obj) if obj.is_empty() => vec![format!("{item_pad}-")],
@@ -202,12 +170,7 @@ fn is_scalar(v: &Value) -> bool {
     !matches!(v, Value::Object(_) | Value::Array(_))
 }
 
-/// `Some(field order)` iff every element is an object, every object has
-/// exactly the same set of field names (order taken from the first
-/// object), and every value in every object is a scalar — the "uniform,
-/// flat-primitive-fields" case §9.3 calls tabular-eligible. Nested-object
-/// or nested-array field values fall back to the list form instead of
-/// attempting field-group folding (deferred, see module doc).
+/// `Some(field order)` iff every element is an object with the same field names (order from the first object) and every value is scalar -- §9.3's tabular-eligible case. Nested field values fall back to the list form.
 fn uniform_tabular_fields(items: &[Value]) -> Option<Vec<String>> {
     if items.len() < 2 {
         return None;
@@ -233,10 +196,7 @@ fn uniform_tabular_fields(items: &[Value]) -> Option<Vec<String>> {
     Some(field_order)
 }
 
-/// Field names in a tabular header are never quoted by this encoder (real
-/// TOON data uses plain identifier-shaped keys in practice) — kept as its
-/// own function so a future encoder change to quote unusual key names has
-/// one place to do it.
+/// Field names in a tabular header are never quoted -- kept as its own function so a future change to quote unusual key names has one place to do it.
 fn encode_bare_field_name(name: &str) -> String {
     name.to_string()
 }
@@ -251,14 +211,7 @@ fn encode_scalar(value: &Value) -> String {
     }
 }
 
-/// Canonical decimal form per §2: no exponent within [1e-6, 1e21) or
-/// zero, no leading zeros, no trailing fractional zeros, integral values
-/// print without a decimal point, -0 normalizes to 0. Outside that range
-/// this falls back to Rust's own float formatting rather than emitting
-/// spec-optional exponent notation — a documented v1 gap (see module
-/// doc), not a silent one: still a valid, round-trippable number, just
-/// not guaranteed byte-identical to another encoder's output for
-/// astronomically large/small values.
+/// Canonical decimal form per §2: no exponent within [1e-6, 1e21) or zero, no leading/trailing zeros, integral values print without a decimal point, -0 normalizes to 0. Outside that range, falls back to Rust's float formatting instead of exponent notation -- still valid and round-trippable, just not guaranteed byte-identical to another encoder for extreme values.
 fn format_number(n: &Number) -> String {
     if let Some(i) = n.as_i64() {
         return i.to_string();
@@ -382,8 +335,7 @@ fn parse_root_array(lines: &[&str], start: usize) -> Result<(Value, usize), Deco
     parse_array_body(lines, start, after, n, 0)
 }
 
-/// Shared by root arrays and object-field arrays: `after` is whatever
-/// followed the `[N]` in the header line (`{f1,f2}:`, `:`, or `: v1,v2`).
+/// Shared by root arrays and object-field arrays: `after` is whatever followed `[N]` in the header line (`{f1,f2}:`, `:`, or `: v1,v2`).
 fn parse_array_body(
     lines: &[&str],
     header_line: usize,
@@ -466,8 +418,7 @@ fn parse_list_item(
             let key = key_part.to_string();
             let value_part = after_hyphen[colon + 1..].trim();
             let (first_value, mut next_line) = if value_part.is_empty() {
-                // Nested object continues at indent+1, OR this is a bare
-                // scalar-less key (rare) -- peek the next line's indent.
+                // Nested object continues at indent+1, or a bare scalar-less key -- peek the next line's indent.
                 if let Some(next) = lines.get(line_no + 1)
                     && line_indent(next) > indent
                     && !next.trim_start().starts_with('-')
@@ -482,11 +433,7 @@ fn parse_list_item(
             };
             let mut obj = Map::new();
             obj.insert(key, first_value);
-            // Remaining sibling fields at indent+1 (object continuation)
-            // -- `parse_object_fields` itself already consumes every
-            // consecutive matching line in one call, stopping at the
-            // first line that isn't a same-indent, non-list-item field,
-            // so this is a single conditional call, not a loop.
+            // Remaining sibling fields at indent+1 -- `parse_object_fields` already consumes every consecutive matching line in one call, so this is a single conditional call, not a loop.
             if let Some(next) = lines.get(next_line)
                 && !next.trim().is_empty()
                 && line_indent(next) == indent + 1
@@ -500,7 +447,7 @@ fn parse_list_item(
             }
             return Ok((Value::Object(obj), next_line));
         }
-        // `- key[N]...` -- a nested array as the object's first field.
+        // `- key[N]...`: a nested array as the object's first field.
         let bracket = after_hyphen.find('[').unwrap();
         let key = after_hyphen[..bracket].to_string();
         let rest = &after_hyphen[bracket..];
@@ -589,8 +536,7 @@ fn parse_object_fields(
     Ok((map, line_no))
 }
 
-/// Splits a delimited (comma) row respecting quoted cells, then hands
-/// each token to `parse_scalar_token`.
+/// Splits a comma-delimited row respecting quoted cells.
 fn split_delimited(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
@@ -599,9 +545,6 @@ fn split_delimited(s: &str) -> Vec<String> {
     while let Some(c) = chars.next() {
         match c {
             '"' if in_quotes => {
-                if chars.peek() == Some(&'\\') {
-                    // handled by the backslash branch below on next iter
-                }
                 in_quotes = false;
                 current.push(c);
             }
@@ -638,11 +581,7 @@ fn parse_scalar_token(token: &str) -> Value {
         _ => {}
     }
     if NUMERIC_LIKE_RE.is_match(token) {
-        // An integer-shaped token (no '.', no exponent) decodes to an
-        // exact integer Number, not a float -- serde_json::Number
-        // distinguishes 1 from 1.0 for equality even though they're
-        // numerically identical, so always going through f64 here would
-        // silently break round-tripping any plain integer value.
+        // An integer-shaped token decodes to an exact integer, not a float -- serde_json::Number distinguishes 1 from 1.0, so always going through f64 would break integer round-tripping.
         if !token.contains('.') && !token.contains(['e', 'E']) {
             if let Ok(i) = token.parse::<i64>() {
                 return Value::Number(Number::from(i));
@@ -694,11 +633,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Real, verbatim examples from the published spec
-    /// (github.com/toon-format/spec, SPEC v4.1, Appendix A) — MIT
-    /// licensed, fair to use directly as fixtures. Confirms this
-    /// encoder's output matches the real spec's own canonical form, not
-    /// just an internally-consistent guess.
+    /// Verbatim examples from the published spec (Appendix A), confirming this encoder matches the spec's canonical form, not just an internally-consistent guess.
     #[test]
     fn matches_the_real_spec_s_nested_object_example() {
         let value = json!({"user": {"id": 123, "name": "Ada"}});
@@ -839,12 +774,7 @@ mod tests {
         assert_eq!(decode(&toon).unwrap(), value);
     }
 
-    /// A list-item object with 3+ fields exercises the "remaining
-    /// sibling fields after the first" path in `parse_list_item` --
-    /// found by clippy flagging that path's original `while` as a loop
-    /// that could never actually loop, which was structurally misleading
-    /// even though the single-call result was correct; this proves the
-    /// simplified version still handles more than one trailing field.
+    /// A list-item object with 3+ fields exercises `parse_list_item`'s "remaining sibling fields" path -- proves the simplified single-call version still handles more than one trailing field.
     #[test]
     fn round_trips_a_list_item_object_with_several_fields() {
         let value = json!([
@@ -888,22 +818,12 @@ mod tests {
 
     #[test]
     fn encode_if_smaller_returns_none_when_toon_is_not_strictly_smaller() {
-        // A bare root scalar: JSON's form is `5` (1 byte), TOON's is
-        // also `5` (root scalars carry no object/array syntax either
-        // way) -- equal, not smaller, so the gate must decline. (Found
-        // while writing this test: a tiny flat OBJECT like {"a":1} is
-        // actually smaller in TOON than JSON, 4 bytes vs 8, because
-        // JSON's braces and quoted key cost more than TOON saves for
-        // objects even at this size -- a real, correct result, not a
-        // bug, just not a fixture that proves this branch.)
+        // A bare root scalar: both forms are `5`, equal not smaller, so the gate must decline.
         let value = json!(5);
         assert_eq!(encode_if_smaller(&value), None);
     }
 
-    /// The real proof, not spec examples alone: graphify's own real
-    /// graph.json nodes array (already used as a real fixture for item
-    /// #3's invariant markers), genuinely messy production data, round
-    /// trips exactly.
+    /// Genuinely messy production data (graphify's own graph.json nodes array), round-trips exactly.
     #[test]
     fn round_trips_graphify_s_real_graph_json_nodes() {
         let path = concat!(

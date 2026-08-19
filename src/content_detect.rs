@@ -1,43 +1,8 @@
-//! Classify content by shape so the right compressor gets picked, instead
-//! of always running the same fixed pipeline regardless of what's inside.
-//! Same idea as headroom's ContentRouter detection step — own design.
+//! Classify content by shape so the right compressor gets picked, instead of always running the same fixed pipeline.
 //!
-//! Combination strategy (deliberate, not arbitrary): the fast regex/parse
-//! checks run first and are authoritative for Json/SearchResults/Log —
-//! measured against real Magika output and found *more* precise for
-//! these three: Magika labeled a single JSON object "jsonl" and had no
-//! dedicated label for ad-hoc application logs at all (finding made with
-//! the original `magika`-crate probe, since superseded by this module's
-//! own tests below, which exercise the same real model). Magika only
-//! gets consulted for whatever those checks don't confidently classify —
-//! where it's a genuine improvement over the old blind "PlainText"
-//! catch-all (real labels: rust, html, diff, csv, markdown, ...).
+//! The fast regex/parse checks run first and are authoritative for Json/SearchResults/Log -- measured more precise than Magika for these three (Magika labeled a single JSON object "jsonl" and has no dedicated log label at all). Magika only gets consulted for whatever those checks don't confidently classify.
 //!
-//! 2026-08-18: ported off the official `magika` crate (and `ort`
-//! underneath it) onto `candle-onnx` running the real, unmodified
-//! `standard_v3_3` model — the same weights the official crate ships,
-//! embedded straight into the binary (`assets/magika-standard_v3_3.onnx`,
-//! sourced from the real `google/magika` repo, sha256
-//! fe2d2eb49c5f88a9e0a6c048e15d6ffdf86235519c2afc535044de433169ec8c).
-//! Motivation: `magika` 1.1.0 hard-pins an exact `ort` prerelease that
-//! conflicts with what other tools in this workspace resolve to — see
-//! docs/ideation/ort-dependency-consistency/2026-08-18-ort-pin-and-bottleneck-plan.md
-//! for the full investigation. Dropping `ort`/`magika` entirely removes
-//! that conflict at the source instead of chasing version numbers.
-//!
-//! candle-onnx 0.11.0 on crates.io can't run this graph as-is (it's
-//! missing the Int32-input, Max, Reciprocal, and GlobalMaxPool ops the
-//! model actually uses) — patched on a fork (see `Cargo.toml`'s
-//! `[patch.crates-io]`) and verified against the real model before this
-//! code was written: exact label match against the real magika CLI on
-//! real files (rust source scores 0.9999454 at the "rust" row, a
-//! markdown file scores 0.99917597 at "markdown", both well clear of
-//! their real thresholds). The byte-feature-extraction algorithm below
-//! and the per-label threshold/overwrite table in `magika_labels.rs` are
-//! ported line-for-line from the real `magika` crate's own
-//! `rust/lib/src/{input,file,model,content}.rs` (Apache-2.0) — not
-//! guessed, not simplified, so classifications stay identical to what
-//! the real magika CLI would report.
+//! Runs on `candle-onnx` with the real, unmodified `standard_v3_3` model (embedded in `assets/magika-standard_v3_3.onnx`, same weights the official `magika` crate ships), not the official crate itself -- `magika` 1.1.0 hard-pins an `ort` prerelease that conflicts with this workspace's other tools. candle-onnx 0.11.0 can't run this graph as-is (missing ops), patched on a fork (see `Cargo.toml`'s `[patch.crates-io]`) and verified against the real magika CLI: exact label match on real files, well clear of thresholds. The feature-extraction algorithm and `magika_labels.rs`'s threshold table are ported line-for-line from magika's own Rust source (Apache-2.0), not guessed.
 
 use crate::magika_labels::MAGIKA_LABELS;
 use candle_core::{DType, Device, Tensor};
@@ -54,60 +19,35 @@ pub enum ContentKind {
     Log,
     Diff,
     PlainText,
-    /// Magika's raw label for content that isn't Json/SearchResults/Log
-    /// and isn't generic prose either (e.g. "rust", "html", "diff",
-    /// "csv", "markdown"). No dedicated compressor per label yet —
-    /// callers currently treat this the same as PlainText for
-    /// compression — but the real classification is preserved for
-    /// observability and future routing.
+    /// Magika's raw label for content that isn't Json/SearchResults/Log or generic prose (e.g. "rust", "html", "diff"). No dedicated compressor yet -- callers treat it like PlainText, but the real label is preserved for observability.
     Other(String),
 }
 
 static SEARCH_RESULT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\S+:\d+:").unwrap());
 static LOG_LEVEL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(error|warn(ing)?|fatal|fail(ed)?)\b").unwrap());
-/// `diff --git`/`--combined`/`--cc` headers, or a naked `--- a/`/`--- /dev/null`
-/// hunk-file marker (unified diff without the git wrapper, e.g. `diff -u`
-/// output). Checked before Log: diff hunks routinely contain words like
-/// "fail"/"error" in test code, which would otherwise misroute them.
+/// `diff --git`/`--combined`/`--cc` headers, or a naked `--- a/` hunk-file marker. Checked before Log: diff hunks routinely contain words like "fail"/"error" in test code.
 static DIFF_HEADER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^diff --(git a/|combined |cc )").unwrap());
 static NAKED_HUNK_OLD_FILE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^--- (a/.+|/dev/null)$").unwrap());
 static HUNK_MARKER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^@@ -\d").unwrap());
 
-/// Magika's label for generic, structureless text — mapped to
-/// ContentKind::PlainText rather than Other("txt"), since that's exactly
-/// what PlainText already means.
+/// Magika's label for generic, structureless text -- mapped to ContentKind::PlainText rather than Other("txt"), since that's exactly what PlainText means.
 const MAGIKA_PLAIN_TEXT_LABEL: &str = "txt";
 
-/// The real magika `standard_v3_3` model, embedded so classification
-/// never needs a model download or a filesystem lookup at runtime.
+/// The real magika `standard_v3_3` model, embedded so classification never needs a download or filesystem lookup at runtime.
 const MODEL_BYTES: &[u8] = include_bytes!("../assets/magika-standard_v3_3.onnx");
 
-/// Decoded once, reused across every `magika_label()` call in the
-/// process — this is a strict improvement over the pre-migration code,
-/// which rebuilt a whole `ort::Session` (the documented ~111ms cost) on
-/// every single call. `None` if the embedded bytes ever fail to decode,
-/// which should never happen for a byte-identical asset checked into
-/// this repo — treated as "AI classification unavailable" rather than a
-/// panic, matching how a missing/corrupt model was already handled
-/// before this migration.
+/// Decoded once, reused across every call. `None` if the embedded bytes ever fail to decode (shouldn't happen for a checked-in asset) -- treated as "AI classification unavailable", not a panic.
 static MODEL: LazyLock<Option<ModelProto>> = LazyLock::new(|| ModelProto::decode(MODEL_BYTES).ok());
 
-/// Real `config.min.json` constants for magika's `standard_v3_3` model —
-/// see `rust/lib/src/config.rs`/`model.rs` in the real `magika` crate.
+/// `config.min.json` constants for magika's `standard_v3_3` model.
 const BEG_SIZE: usize = 1024;
 const END_SIZE: usize = 1024;
 const BLOCK_SIZE: usize = 4096;
 const PADDING_TOKEN: i64 = 256;
-/// If the model still sees padding at this offset, the real content
-/// captured at the front of the file is too short for magika to have
-/// bothered training on — the real crate falls back to a rule (UTF-8 ->
-/// Txt, else -> Unknown) rather than trusting the model. Content here is
-/// always a Rust `&str`, so that rule always resolves to Txt, which is
-/// exactly what `magika_label()` returning `None` already maps to below
-/// — no separate rule path needed.
+/// If the model still sees padding at this offset, content is too short for magika's model to be trusted -- the real crate falls back to a UTF-8/Unknown rule, which for a Rust `&str` always resolves to Txt, exactly what `magika_label()` returning `None` already maps to.
 const MIN_FILE_SIZE_FOR_DL: usize = 8;
 
 pub fn detect(content: &str) -> ContentKind {
@@ -145,9 +85,7 @@ pub fn detect(content: &str) -> ContentKind {
     match magika_label(content) {
         Some(label) if label == MAGIKA_PLAIN_TEXT_LABEL => ContentKind::PlainText,
         Some(label) => ContentKind::Other(label),
-        // Magika unavailable/failed, or too little content to trust the
-        // model on — don't hard-fail detection over an optional
-        // enrichment signal, fall back to the old behavior.
+        // Magika unavailable/failed or content too short -- don't hard-fail an optional enrichment signal.
         None => ContentKind::PlainText,
     }
 }
@@ -167,9 +105,7 @@ fn magika_label(content: &str) -> Option<String> {
         .to_vec1()
         .ok()?;
 
-    // Same tie-breaking as the real crate's `FileType::convert`: on a
-    // tie, the later index wins (`scores[best].max(x) == x` is true for
-    // x >= scores[best]).
+    // Same tie-breaking as the real crate: on a tie, the later index wins.
     let mut best = 0usize;
     for (i, &x) in scores.iter().enumerate() {
         if scores[best].max(x) == x {
@@ -185,9 +121,7 @@ fn magika_label(content: &str) -> Option<String> {
     Some(label.to_string())
 }
 
-/// Real byte-feature extraction, ported from the magika crate's
-/// `rust/lib/src/input.rs::extract_features_async` (synchronous here —
-/// content is always already in memory, no file I/O to overlap).
+/// Byte-feature extraction, ported from magika's `input.rs::extract_features_async` (synchronous here since content is always already in memory).
 fn extract_features(content: &[u8]) -> Option<Vec<i64>> {
     let file_len = content.len();
     if file_len == 0 {
@@ -208,11 +142,7 @@ fn extract_features(content: &[u8]) -> Option<Vec<i64>> {
     Some(features)
 }
 
-/// `right_align == false`: content lands at the start of `dst`, padding
-/// trails at the end (used for the file's beginning). `right_align ==
-/// true`: content lands at the end of `dst`, padding leads at the start
-/// (used for the file's end) — matches `input.rs::copy_features`'s
-/// `align` parameter (0 vs 1) exactly.
+/// `right_align == false`: content at the start of `dst`, padding trails (file's beginning). `right_align == true`: content at the end, padding leads (file's end) -- matches magika's own `align` parameter.
 fn copy_features(dst: &mut [i64], src: &[u8], right_align: bool) {
     let len = dst.len().min(src.len());
     let dst_start = if right_align { dst.len() - len } else { 0 };
@@ -273,9 +203,7 @@ mod tests {
 
     #[test]
     fn malformed_json_like_content_falls_through() {
-        // starts with { but isn't valid JSON — must not misclassify.
-        // Also not log/search-shaped, so this exercises the Magika
-        // fallback path for real.
+        // Starts with { but isn't valid JSON, and isn't log/search-shaped -- exercises the Magika fallback path.
         let content = "{ this is not json, just a sentence with a brace }";
         let kind = detect(content);
         assert!(
@@ -304,10 +232,7 @@ mod tests {
 
     #[test]
     fn detects_git_diff_via_fast_regex() {
-        // The fast regex tier now catches this before it ever reaches
-        // Magika — diffs are a stronger, cheaper-to-check signal than a
-        // probabilistic classifier, same reasoning as Json/SearchResults/
-        // Log above.
+        // The fast regex tier catches this before it ever reaches Magika -- a stronger, cheaper signal than a probabilistic classifier.
         let content = "diff --git a/src/main.rs b/src/main.rs\nindex abc..def 100644\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,3 +1,3 @@\n-let x = 5;\n+let x = 10;\n";
         assert_eq!(detect(content), ContentKind::Diff);
     }
@@ -327,8 +252,7 @@ mod tests {
 
     #[test]
     fn very_short_content_falls_back_to_plain_text() {
-        // Fewer than MIN_FILE_SIZE_FOR_DL real bytes -- magika's own rule
-        // path, not a model call.
+        // Fewer than MIN_FILE_SIZE_FOR_DL bytes -- magika's rule path, not a model call.
         assert_eq!(detect("hi"), ContentKind::PlainText);
     }
 }

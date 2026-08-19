@@ -1,21 +1,8 @@
-//! Extracts human/assistant prose from a Claude Code session transcript
-//! and builds a ready-to-stage digest — the Rust port of
-//! `mindforge/tools/session_to_trm.py` + the extraction half of
-//! `extract_claude_sessions.py` (both Python, read in full before
-//! porting; see docs/plan-2026-08-07-session-digest.md).
+//! Extracts human/assistant prose from a Claude Code session transcript and builds a ready-to-stage digest.
 //!
-//! Deliberately **not** layered on `session_prune`: that module prunes
-//! `tool_result` content; this one discards all `tool_use`/`tool_result`
-//! blocks outright, unconditionally, keeping only `type: "text"` blocks
-//! from `user`/`assistant` messages. The two operate on disjoint fields
-//! of the same transcript — running one before the other has no effect.
-//! Real finding from reading both real implementations side by side
-//! before assuming they'd compose, not assumed.
+//! Not layered on `session_prune`: that module prunes `tool_result` content; this one discards all `tool_use`/`tool_result` blocks outright, keeping only `type: "text"` blocks from `user`/`assistant` messages. The two operate on disjoint fields of the same transcript, so running one before the other has no effect.
 //!
-//! Boundary held: this module only extracts and formats text. It never
-//! calls `trm` or anything storage-shaped — that stays total-recall's
-//! job (`trm ingest-session`), consistent with squishi's boundary rule
-//! stated everywhere else in this crate.
+//! This module only extracts and formats text -- it never calls `trm` or anything storage-shaped, which stays total-recall's job.
 
 use serde_json::Value;
 
@@ -28,19 +15,11 @@ pub struct SessionMeta {
     pub turn_count: usize,
     pub truncated: bool,
     pub raw_bytes: usize,
-    /// Total physical lines in the `jsonl` passed to `extract_session_text`
-    /// — independent of `start_line` (counted even over skipped lines).
-    /// A caller doing incremental extraction across repeated calls against
-    /// the same (growing, append-only) transcript saves this verbatim as
-    /// the next call's `start_line`, so each call only re-processes what's
-    /// new since the last one (ADR-0006 Phase 2).
+    /// Total physical lines in `jsonl`, independent of `start_line` (counted even over skipped lines). An incremental caller saves this as the next call's `start_line`, so each call only re-processes what's new.
     pub total_lines: usize,
 }
 
-/// Strip a trailing `<system-reminder>...</...>` block — everything
-/// from the first occurrence of the tag to the end of the string, same
-/// as the Python version's `re.DOTALL` substitution (not just the same
-/// line: a system-reminder block is typically multi-line).
+/// Strip a trailing `<system-reminder>...</...>` block -- everything from the first occurrence of the tag onward, since a system-reminder block is typically multi-line.
 fn strip_system_reminder(text: &str) -> String {
     match text.find("<system-reminder>") {
         Some(idx) => text[..idx].trim().to_string(),
@@ -48,10 +27,7 @@ fn strip_system_reminder(text: &str) -> String {
     }
 }
 
-/// Truncate `text` to `max_chars` *characters* (not bytes — Rust byte
-/// slicing panics mid-UTF-8-char; Python's `len()`/slicing is
-/// codepoint-based, so this must be too), keeping the head and tail and
-/// dropping the middle, matching the Python version's shape exactly.
+/// Truncate `text` to `max_chars` *characters*, not bytes -- Rust byte slicing panics mid-UTF-8-char. Keeps the head and tail, drops the middle.
 fn truncate_middle(text: &str, max_chars: usize) -> (String, bool) {
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= max_chars {
@@ -66,18 +42,9 @@ fn truncate_middle(text: &str, max_chars: usize) -> (String, bool) {
     )
 }
 
-/// Pull human + assistant text turns only from a transcript. Returns
-/// `(text, meta)`. Defensive throughout: an unparseable or unrecognized
-/// line is skipped, never a hard error — same discipline as
-/// `session_prune::parse`, same reason (transcript JSONL isn't a
-/// versioned contract).
+/// Pull human + assistant text turns only from a transcript. An unparseable or unrecognized line is skipped, never a hard error, since transcript JSONL isn't a versioned contract.
 ///
-/// `start_line` (ADR-0006 Phase 2) skips the first N physical lines of
-/// `jsonl` before extracting — `jsonl` is still the FULL current
-/// transcript (re-read fresh each call, not a slice), so an incremental
-/// caller passes the same growing file with an advancing `start_line`
-/// each time, getting back only the delta since the previous call. Pass
-/// `0` for the original whole-file behavior.
+/// `start_line` skips the first N physical lines of `jsonl` before extracting -- `jsonl` is still the full current transcript, re-read fresh each call, so an incremental caller passes the same growing file with an advancing `start_line` to get only the delta since the previous call. Pass `0` for whole-file behavior.
 pub fn extract_session_text(
     jsonl: &str,
     max_chars: usize,
@@ -92,9 +59,7 @@ pub fn extract_session_text(
     let mut total_lines = 0usize;
 
     for (idx, line) in jsonl.lines().enumerate() {
-        // Counted regardless of the start_line skip below, so
-        // `total_lines` always reflects the FULL current input -- what an
-        // incremental caller needs to save as its next `start_line`.
+        // Counted regardless of the start_line skip below, so `total_lines` always reflects the full input.
         total_lines = idx + 1;
         if idx < start_line {
             continue;
@@ -176,8 +141,6 @@ pub fn extract_session_text(
     (text, meta)
 }
 
-/// Same fixed header format as the Python version's
-/// `build_digest_content`.
 pub fn build_digest_content(compressed: &str, meta: &SessionMeta) -> String {
     format!(
         "SESSION DIGEST {}\n\n---\ntype: session-digest\nsession_id: {}\ncwd: {}\nfirst_ts: {}\nlast_ts: {}\nturn_count: {}\n---\n\n{compressed}",
@@ -194,9 +157,7 @@ pub fn build_digest_content(compressed: &str, meta: &SessionMeta) -> String {
 mod tests {
     use super::*;
 
-    /// Real-shape fixture lines — same field names/structure as a live
-    /// Claude Code transcript (confirmed by direct inspection, see
-    /// session_prune's own module doc for the same discipline).
+    /// Real-shape fixture lines -- same field names/structure as a live Claude Code transcript.
     fn text_line(role: &str, text: &str, session_id: &str, cwd: &str, ts: &str) -> String {
         format!(
             r#"{{"type":"{role}","sessionId":"{session_id}","cwd":"{cwd}","timestamp":"{ts}","message":{{"role":"{role}","content":[{{"type":"text","text":{}}}]}}}}"#,
@@ -234,7 +195,7 @@ mod tests {
         assert_eq!(meta.total_lines, 2);
     }
 
-    // --- start_line (ADR-0006 Phase 2): incremental extraction ---
+    // --- start_line: incremental extraction ---
 
     #[test]
     fn start_line_zero_matches_the_original_whole_file_behavior() {
@@ -257,14 +218,11 @@ mod tests {
             text_line("user", "first turn", "sess-1", "/repo", "t1"),
             text_line("assistant", "second turn", "sess-1", "/repo", "t2"),
         );
-        // Line 0 is the first turn -- start_line: 1 skips it, keeping only
-        // the second.
+        // Line 0 is the first turn -- start_line: 1 skips it, keeping only the second.
         let (text, meta) = extract_session_text(&jsonl, 100_000, 1);
         assert_eq!(text, "ASSISTANT: second turn");
         assert_eq!(meta.turn_count, 1);
-        // total_lines reflects the FULL input (2), not "lines processed
-        // after the skip" -- what an incremental caller needs to save as
-        // its next start_line.
+        // total_lines reflects the full input (2), not lines processed after the skip.
         assert_eq!(meta.total_lines, 2);
     }
 
@@ -278,16 +236,12 @@ mod tests {
         let (text, meta) = extract_session_text(&jsonl, 100_000, 5);
         assert_eq!(text, "");
         assert_eq!(meta.turn_count, 0);
-        // Still the real total, even though nothing was processed.
         assert_eq!(meta.total_lines, 2);
     }
 
     #[test]
     fn a_second_call_with_the_first_calls_total_lines_yields_only_new_content() {
-        // Simulates the real incremental pattern: call once, save
-        // total_lines, append new turns, call again with that saved
-        // value as start_line -- confirms the result is a strict suffix
-        // of what a whole-file call would have produced.
+        // Call once, save total_lines, append new turns, call again with that value as start_line -- result must be a strict suffix of a whole-file call.
         let first_turn = text_line("user", "first turn", "sess-1", "/repo", "t1");
         let jsonl_v1 = format!("{first_turn}\n");
         let (_, meta_v1) = extract_session_text(&jsonl_v1, 100_000, 0);
@@ -351,15 +305,11 @@ mod tests {
 
     #[test]
     fn truncation_is_char_safe_with_multibyte_content() {
-        // A string full of multi-byte UTF-8 characters — byte-index
-        // slicing at an arbitrary offset would panic here if this
-        // weren't char-safe.
+        // Multi-byte UTF-8 content -- byte-index slicing would panic here if this weren't char-safe.
         let content = "café ".repeat(30);
         let jsonl = text_line("user", &content, "s", "/r", "t") + "\n";
         let (text, meta) = extract_session_text(&jsonl, 20, 0);
         assert!(meta.truncated);
-        // Must not panic, and must still be valid UTF-8 (guaranteed by
-        // type, but assert content is non-empty and sane).
         assert!(text.contains("café"));
     }
 

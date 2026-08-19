@@ -22,146 +22,74 @@ use squishi::toon;
     about = "Rust-native text compressor — detects content shape, routes to the right technique. No store, no retrieve, that's total-recall's job"
 )]
 struct Cli {
-    /// Text to compress. Omit to read from stdin instead — the harness-
-    /// agnostic path: no shell-argument size limit, no quoting/escaping
-    /// fragility on large multi-line content (a big diff, log, or file
-    /// read), unlike passing content as a positional argument.
+    /// Text to compress. Omit to read from stdin instead -- no shell-argument size limit or quoting fragility on large multi-line content.
     text: Option<String>,
 
-    /// Emit the full JSON contract (compressed/kind/source/chars_before/
-    /// chars_after/...) instead of the default bare compressed text.
-    /// governator and other programmatic consumers want this; a harness
-    /// piping content through for its own use generally just wants the
-    /// compressed text back.
+    /// Emit the full JSON contract (compressed/kind/source/chars_before/chars_after/...) instead of the default bare compressed text.
     #[arg(long)]
     json: bool,
 
-    /// Run self-diagnostics instead of compressing `text` (ignored when
-    /// set). Not a subcommand: squishi's Cli has no Commands enum, and
-    /// `squishi doctor` would be ambiguous with compressing the literal
-    /// string "doctor" — a flag has no such collision.
+    /// Run self-diagnostics instead of compressing `text`. A flag, not a subcommand, so `squishi doctor` isn't ambiguous with compressing the literal string "doctor".
     #[arg(long)]
     doctor: bool,
 
-    /// With --doctor, skip the two model-load checks (magika,
-    /// semantic-dedup). Ignored without --doctor.
+    /// With --doctor, skip the two model-load checks (magika, semantic-dedup).
     #[arg(long)]
     quick: bool,
 
-    /// Run structural session pruning against a Claude Code transcript
-    /// (JSONL) instead of compressing `text` (ignored when set). Same
-    /// "flag not subcommand" reasoning as --doctor.
+    /// Run structural session pruning against a Claude Code transcript (JSONL) instead of compressing `text`.
     #[arg(long, value_name = "TRANSCRIPT_PATH")]
     session_prune: Option<std::path::PathBuf>,
 
-    /// With --session-prune, also run rule 2 (supersede a Write/Edit's
-    /// result once a later Read of the same path exists) — off by
-    /// default per the technical-board review's real false-positive
-    /// concern (2026-08-07). Ignored without --session-prune.
+    /// With --session-prune, also run rule 2 (supersede a Write/Edit's result once a later Read of the same path exists) -- off by default, real false-positive concern.
     #[arg(long)]
     include_rule_2: bool,
 
-    /// With --session-prune, minimum tool-result byte size counted by
-    /// the "prune old large outputs" rule.
+    /// With --session-prune, minimum tool-result byte size counted by the "prune old large outputs" rule.
     #[arg(long, default_value_t = 2000)]
     min_bytes: usize,
 
-    /// With --session-prune, how many of the most recent session items
-    /// are exempt from the "prune old large outputs" rule.
+    /// With --session-prune, how many of the most recent session items are exempt from the "prune old large outputs" rule.
     #[arg(long, default_value_t = 200)]
     window: usize,
 
-    /// With --session-prune, write a pruned *copy* of the transcript to
-    /// this path instead of printing a stats report. Never mutates the
-    /// input transcript.
+    /// With --session-prune, write a pruned *copy* of the transcript to this path instead of printing a stats report. Never mutates the input.
     #[arg(long, value_name = "OUT_PATH")]
     write: Option<std::path::PathBuf>,
 
-    /// Extract human/assistant prose from a Claude Code session
-    /// transcript (JSONL), compress it, and build a ready-to-stage
-    /// digest — instead of compressing `text` (ignored when set). Same
-    /// "flag not subcommand" reasoning as --doctor. Extraction and
-    /// compression only; squishi never calls total-recall itself
-    /// (`trm ingest-session` is the caller that stages the result).
+    /// Extract human/assistant prose from a Claude Code session transcript (JSONL), compress it, and build a ready-to-stage digest, instead of compressing `text`. Extraction and compression only -- squishi never calls total-recall itself.
     #[arg(long, value_name = "TRANSCRIPT_PATH")]
     session_digest: Option<std::path::PathBuf>,
 
-    /// Report cumulative real savings (chars_before/chars_after, per
-    /// content kind and total) from every squishi `--json` call found in
-    /// a Claude Code session transcript (JSONL) — instead of compressing
-    /// `text` (ignored when set). Same "flag not subcommand" reasoning as
-    /// `--doctor`. Read-only: never mutates the transcript.
+    /// Report cumulative real savings from every squishi `--json` call found in a session transcript (JSONL), instead of compressing `text`. Read-only.
     #[arg(long, value_name = "TRANSCRIPT_PATH")]
     session_stats: Option<std::path::PathBuf>,
 
-    /// With --session-digest, the extracted-text truncation cap (middle
-    /// dropped, head+tail kept), matching session_to_trm.py's default.
+    /// With --session-digest, the extracted-text truncation cap (middle dropped, head+tail kept).
     #[arg(long, default_value_t = 100_000)]
     max_chars: usize,
 
-    /// With --session-digest, skip the first N physical lines of the
-    /// transcript before extracting (ADR-0006 Phase 2) — an incremental
-    /// caller re-reads the same, still-growing transcript on each call
-    /// and passes the previous call's `total_lines` (from `--json`) here,
-    /// getting back only the delta since then. `0` (default) is the
-    /// original whole-file behavior.
+    /// With --session-digest, skip the first N physical lines before extracting -- an incremental caller passes the previous call's `total_lines` here to get only the delta since then.
     #[arg(long, default_value_t = 0)]
     start_line: usize,
 
-    /// Skip shape detection and force this content kind — for a caller
-    /// that already knows structurally what it's staging (e.g. total-
-    /// recall's persona ingestion knows a cleaned YouTube-caption
-    /// transcript is conversational prose) rather than trusting
-    /// `detect()`'s heuristics, which can misfire on prose containing
-    /// ordinary words like "failed" (see `content_detect.rs`'s
-    /// LOG_LEVEL_RE — no structural check, matches on the word alone).
-    /// Only `plain-text` is wired today; other kinds don't need forcing
-    /// since detect() already identifies them reliably.
+    /// Skip shape detection and force this content kind, for a caller that already knows structurally what it's staging rather than trusting `detect()`'s heuristics (which can misfire on prose containing words like "failed"). Only `plain-text` is wired; other kinds don't need forcing.
     #[arg(long, value_enum)]
     force_kind: Option<ForceKind>,
 
-    /// Process many texts in one process instead of one per invocation
-    /// (ignores `text`; reads a JSON array from stdin instead:
-    /// `[{"id": "...", "text": "..."}, ...]`). The real reason this
-    /// exists: a caller processing N texts by spawning N separate
-    /// `squishi` invocations pays for a fresh model load every time —
-    /// found 2026-08-08 batch-reingesting persona videos this way, each
-    /// one reloading the ~562MB punctuation model from scratch. Batch
-    /// mode loads once, reuses it across every item. Always emits the
-    /// full `--json` contract per item (plus `id`), as a JSON array —
-    /// there's no bare-text form for multiple outputs.
+    /// Process many texts in one process instead of one per invocation (ignores `text`; reads a JSON array from stdin: `[{"id": "...", "text": "..."}, ...]`). Loads the model once and reuses it across every item, instead of paying a fresh load per subprocess. Always emits the full `--json` contract per item plus `id`, as a JSON array.
     #[arg(long)]
     batch: bool,
 
-    /// How hard each compressor pushes: `conservative` keeps more context
-    /// (safer, smaller savings), `aggressive` cuts harder (bigger savings,
-    /// more loss). Tunes json_compress's keep_edge, diff_compress's
-    /// context/hunk/file caps, log_compress's error/warning/context/
-    /// total-line caps, and semantic-dedup's paraphrase-similarity cutoff
-    /// — every threshold that was previously a fixed constant. Applies to
-    /// the default compression path and `--batch`; not read by
-    /// `--session-prune`/`--session-digest` (out of scope for this flag).
+    /// How hard each compressor pushes: `conservative` keeps more context (safer, smaller savings), `aggressive` cuts harder (bigger savings, more loss). Applies to the default path and `--batch`; not read by `--session-prune`/`--session-digest`.
     #[arg(long, value_enum, default_value_t = Level::Default)]
     level: Level,
 
-    /// Write a real roff(7) man page (squishi.1) to this directory instead
-    /// of compressing `text` (ignored when set). Same "flag not
-    /// subcommand" reasoning as --doctor. Regenerated from this exact
-    /// `Cli` definition via `clap_mangen` — every flag's doc comment above
-    /// becomes the man page's OPTIONS text, so the two can never drift the
-    /// way a hand-maintained man page would.
+    /// Write a real roff(7) man page (squishi.1) to this directory instead of compressing `text`. Regenerated from this exact `Cli` definition via `clap_mangen`, so the man page can never drift from these flags.
     #[arg(long, value_name = "OUT_DIR", hide = true)]
     generate_man: Option<std::path::PathBuf>,
 
-    /// Encode `text` (must be valid JSON) as TOON instead of running the
-    /// normal detect+compress pipeline — same "flag not subcommand"
-    /// reasoning as --doctor. Real, public, MIT-licensed format
-    /// (github.com/toon-format/spec, SPEC v4.1) — lossless, so unlike
-    /// every other mode here, nothing is ever elided or dropped, only
-    /// re-encoded. Only ships TOON if it measures smaller than the JSON
-    /// input; otherwise the original JSON is printed unchanged, same
-    /// "never ship a result that isn't actually smaller" discipline every
-    /// other compressor in this crate already follows.
+    /// Encode `text` (must be valid JSON) as TOON instead of running the normal detect+compress pipeline. Lossless, unlike every other mode here. Only ships TOON if it measures smaller than the JSON input; otherwise prints the original JSON unchanged.
     #[arg(long)]
     toon: bool,
 }
@@ -180,10 +108,7 @@ enum Level {
     Aggressive,
 }
 
-/// Resolved per-level thresholds for every tunable compressor surface.
-/// Constructed once per `route_impl` call rather than threading four
-/// separate params — `--level` is a single caller-facing knob, this is
-/// its one expansion point.
+/// Resolved per-level thresholds for every tunable compressor surface -- `--level` is a single caller-facing knob, this is its one expansion point.
 struct LevelConfigs {
     paraphrase_threshold: f32,
     diff: DiffCompressConfig,
@@ -191,11 +116,7 @@ struct LevelConfigs {
     json: JsonCompressConfig,
 }
 
-/// Real values chosen after measuring each level on real fixtures (see
-/// README's `--level` section for the measured before/after table) — not
-/// guessed. `Default` reproduces this repo's pre-`--level` fixed
-/// constants exactly, so `--level default` (the default) is a byte-for-
-/// byte no-op versus every pre-existing test and caller.
+/// Values measured on real fixtures (see README's `--level` section). `Default` reproduces this repo's pre-`--level` constants exactly, so it's a byte-for-byte no-op versus every pre-existing caller.
 fn configs_for_level(level: Level) -> LevelConfigs {
     match level {
         Level::Conservative => LevelConfigs {
@@ -253,28 +174,16 @@ const PARAPHRASE_THRESHOLD: f32 = 0.80; // matches dedupe_semantic.py's default
 struct Output {
     compressed: String,
     source: &'static str,
-    /// Extra fields flattened into the top-level JSON output alongside
-    /// compressed/kind/source/chars_before/chars_after — shape varies by
-    /// which compressor ran (elements_before/after, lines_before/after,
-    /// files_affected/hunks_removed, sentences_before/after, ...).
+    /// Extra fields flattened into the top-level JSON output alongside compressed/kind/source/chars_before/chars_after -- shape varies by which compressor ran.
     detail: Map<String, Value>,
 }
 
-/// The full routing decision: detect content shape, pick and run the
-/// matching compressor. Pulled out of `main` so it's callable from tests —
-/// this is the actual logic governator's squishi.rs wrapper depends on,
-/// and it had zero direct test coverage before this existed only inline
-/// in `main()`.
+/// The full routing decision: detect content shape, pick and run the matching compressor. Pulled out of `main` so it's callable from tests and from governator's squishi.rs wrapper.
 fn route(text: &str) -> (ContentKind, Output) {
     route_with_override(text, None)
 }
 
-/// Like `route_with_override`, but with an explicit `--level` rather than
-/// the implicit `Level::Default` `route_with_override` always uses. The
-/// CLI's default (non-`--batch`) path uses this so `--level` actually
-/// reaches single-shot invocations; `route`/`route_with_override` stay
-/// level-less for existing callers (tests, `--session-digest`) that have
-/// no `--level` concept.
+/// Like `route_with_override`, but with an explicit `--level` instead of the implicit `Level::Default`. The CLI's single-shot path uses this; tests and `--session-digest` stay level-less.
 fn route_with_level(
     text: &str,
     forced_kind: Option<ContentKind>,
@@ -291,22 +200,10 @@ fn route_with_level(
     )
 }
 
-/// Same eligibility gate `SemanticDedup::dedupe` takes — see its own
-/// doc comment. Threaded down from `--batch`'s per-item field (default
-/// `true`, matching the pre-existing behavior this flag was added
-/// alongside) or `route`/`route_with_override`'s implicit `true`
-/// (single-shot callers have no per-item concept to gate on).
+/// Same eligibility gate `SemanticDedup::dedupe` takes -- see its own doc comment.
 const ALLOW_PUNCTUATION_RESTORE_DEFAULT: bool = true;
 
-/// Same as `route`, but `forced_kind` — when given — skips `detect()`
-/// entirely instead of guessing. The caller-asserted path: a caller that
-/// already knows the content's shape (total-recall's persona ingestion
-/// knows a cleaned transcript is prose) shouldn't be at the mercy of a
-/// heuristic that can misclassify it. Single-shot: loads its own
-/// `SemanticDedup` (and, transitively, the punctuation-restoration
-/// model) fresh every call — see `--batch`'s handling in `main()` for the reused-model
-/// path a caller processing many texts in one process should use
-/// instead.
+/// Same as `route`, but `forced_kind` -- when given -- skips `detect()` entirely for a caller that already knows the content's shape, rather than trusting a heuristic that can misclassify it. Single-shot: loads its own `SemanticDedup` fresh every call; see `--batch` for the reused-model path.
 fn route_with_override(text: &str, forced_kind: Option<ContentKind>) -> (ContentKind, Output) {
     let mut dedup_cache = None;
     route_impl(
@@ -319,15 +216,7 @@ fn route_with_override(text: &str, forced_kind: Option<ContentKind>) -> (Content
     )
 }
 
-/// Loads `SemanticDedup` into `cache` on first need, reused on every
-/// subsequent call — the ~90MB MiniLM model and (lazily, inside it) the
-/// ~562MB punctuation model both get paid for once per `cache`, not
-/// once per `route_impl` call. `route_with_override`'s single-shot path
-/// passes a fresh, discarded-after-use cache (same cost as before this
-/// existed); `--batch`'s loop in `main()` passes one cache shared across an entire
-/// batch — the real fix for a caller that was previously spawning one
-/// fresh `squishi` subprocess per item (found 2026-08-08: reingesting
-/// 19 persona videos this way reloaded the punctuation model 19 times).
+/// Loads `SemanticDedup` into `cache` on first need, reused on every subsequent call -- `--batch` shares one cache across an entire run instead of reloading the model per item.
 fn ensure_dedup_loaded(cache: &mut Option<SemanticDedup>) -> Result<&mut SemanticDedup, String> {
     if cache.is_none() {
         *cache = Some(SemanticDedup::load()?);
@@ -343,23 +232,11 @@ fn route_impl(
     include_embedding: bool,
     level: Level,
 ) -> (ContentKind, Output) {
-    // Unconditional pre-pass, not a ContentKind of its own — Claude
-    // Code's real Read tool wraps file content in a `cat -n`-style
-    // `N\t<line>` prefix, which confuses both detect() (Magika
-    // classifies it as Other("tsv"), a kind squishi has no compressor
-    // for) and every line-anchored fast-path regex (Diff/Log/
-    // SearchResults). Stripped before detection runs — real finding from
-    // governator-proxy's Step 2 live-API check, see
-    // line_number_strip.rs's own module doc comment for the real
-    // before/after numbers.
+    // Claude Code's Read tool wraps file content in a `cat -n`-style `N\t<line>` prefix, which confuses both detect() and line-anchored fast-path regexes -- stripped before detection runs.
     let (text, line_numbers_stripped) = strip_read_tool_line_numbers(text);
     let text = text.as_str();
 
-    // Unconditional pre-pass, not a ContentKind of its own — a base64 blob
-    // (an embedded screenshot, a data-URI) can appear inside any shape
-    // detect() classifies below, so it's stripped before detection runs,
-    // the same way MCE's Layer1Pruner runs ahead of its shape-aware
-    // routing (audited 2026-08-07, see docs/plan-2026-08-07-base64-strip.md).
+    // A base64 blob (embedded screenshot, data-URI) can appear inside any shape detect() classifies below, so it's stripped before detection runs.
     let (text, base64_blobs_removed) = strip_base64_blobs(text);
     let text = text.as_str();
 
@@ -385,8 +262,7 @@ fn route_impl(
                     ),
                 ]),
             },
-            // Valid JSON but not an array (e.g. a single object) —
-            // nothing repeatable to compress, pass through unchanged.
+            // Valid JSON but not an array -- nothing repeatable to compress, pass through unchanged.
             None => Output {
                 compressed: text.to_string(),
                 source: "json-passthrough",
@@ -546,9 +422,7 @@ fn route_impl(
                             source: "dedup+semantic",
                         }
                     }
-                    // Model unavailable (offline, first-run download
-                    // failed) — line-dedup's result is still real
-                    // compression, use it rather than failing outright.
+                    // Model unavailable (offline, first-run download failed) -- line-dedup's result is still real compression, use it rather than failing outright.
                     Err(e) => Output {
                         compressed: deduped,
                         source: "dedup-semantic-unavailable",
@@ -557,9 +431,7 @@ fn route_impl(
                 }
             }
         }
-        // Other(_) carries Magika's real classification (rust/html/diff/
-        // csv/markdown/...) — structured formats, not prose, so sentence-
-        // level paraphrase dedup doesn't apply; line_dedup only.
+        // Other(_) is a structured format (rust/html/diff/csv/...), not prose, so sentence-level dedup doesn't apply -- line_dedup only.
         ContentKind::Other(_) => Output {
             compressed: dedupe_line_runs(text),
             source: "dedup",
@@ -583,14 +455,7 @@ fn route_impl(
     (kind, output)
 }
 
-/// Builds the CLI's full JSON output contract — governator's
-/// `squishi.rs` wrapper depends on exactly these top-level fields (plus
-/// whatever `detail` flattens in). A plain `Map<String, Value>`, not a
-/// `#[derive(Serialize)]` struct: real `Value` types (not string
-/// formatting) already give correct escaping on their own — a derive
-/// macro buys nothing here beyond what this one shared function already
-/// gets by existing, and it's not worth a proc-macro dependency for a
-/// secondary, opt-in output path (`--json`; the default is bare text).
+/// Builds the CLI's full JSON output contract -- governator's `squishi.rs` wrapper depends on exactly these top-level fields plus whatever `detail` flattens in.
 fn build_output(text: &str, kind: &ContentKind, output: Output) -> Map<String, Value> {
     let chars_after = output.compressed.len();
     let mut json = Map::new();
@@ -603,24 +468,7 @@ fn build_output(text: &str, kind: &ContentKind, output: Output) -> Map<String, V
     json
 }
 
-/// Parses `--batch`'s stdin contract: a JSON array of `{"id", "text",
-/// "restore_punctuation", "include_embedding"}` objects, returned as
-/// `(id, text, allow_punctuation_restore, include_embedding)` tuples in
-/// the original order. `restore_punctuation` is optional per item,
-/// defaulting to `true` (matches this flag's own pre-existing default,
-/// no behavior change for callers that don't set it) — a caller that
-/// knows a source never needs it (Wikipedia, git commit messages —
-/// already have real punctuation) sets it `false` explicitly rather
-/// than relying solely on the content-density heuristic.
-/// `include_embedding` is optional, defaulting to `false` — opt-in, so
-/// every existing caller's output stays exactly as lean as before;
-/// only a caller that actually wants each kept sentence's already-
-/// computed embedding (to reuse for its own downstream embedding-based
-/// work, instead of re-embedding the same text a second time) pays for
-/// the larger response. Hand-parsed against `serde_json::Value` rather
-/// than a `#[derive(Deserialize)]` struct — same reasoning
-/// `build_output` already gives for not pulling in a derive dependency
-/// for a secondary, opt-in path.
+/// Parses `--batch`'s stdin contract: a JSON array of `{"id", "text", "restore_punctuation", "include_embedding"}` objects, as `(id, text, allow_punctuation_restore, include_embedding)` tuples in order. Both booleans are optional per item (default `true`/`false` respectively).
 fn parse_batch_items(raw: &str) -> Result<Vec<(String, String, bool, bool)>, String> {
     let value: Value =
         serde_json::from_str(raw).map_err(|e| format!("--batch stdin must be valid JSON: {e}"))?;
@@ -655,11 +503,7 @@ fn parse_batch_items(raw: &str) -> Result<Vec<(String, String, bool, bool)>, Str
         .collect()
 }
 
-/// Resolve the content to compress: the positional argument if given,
-/// otherwise stdin. Refuses to block reading from an interactive
-/// terminal with neither — that's almost always a forgotten argument,
-/// not someone about to type input, and hanging silently is the worst
-/// failure mode for a tool meant to sit in an automated pipeline.
+/// Resolve the content to compress: the positional argument if given, otherwise stdin. Refuses to block on an interactive terminal with neither, since that's almost always a forgotten argument, not someone about to type input.
 fn read_input(cli: &Cli) -> Result<String, String> {
     if let Some(text) = &cli.text {
         return Ok(text.clone());
@@ -818,12 +662,7 @@ fn main() {
         let (extracted, meta) =
             session_digest::extract_session_text(&jsonl, cli.max_chars, cli.start_line);
         if extracted.trim().is_empty() {
-            // A genuinely empty whole-file digest is still worth failing
-            // loudly on (today's behavior, unchanged). An incremental
-            // call (start_line > 0) coming back empty is normal, not an
-            // error -- "nothing new since the last checkpoint" -- so it
-            // falls through to the same success path below, still
-            // carrying `total_lines` the caller needs regardless.
+            // A whole-file digest coming back empty still fails loudly; an incremental call (start_line > 0) coming back empty just means nothing's new since the last checkpoint.
             if cli.start_line == 0 {
                 eprintln!("nothing to digest (empty session)");
                 std::process::exit(1);
@@ -1001,8 +840,7 @@ mod tests {
     fn parse_batch_items_parses_a_real_array() {
         let raw = r#"[{"id": "a", "text": "first"}, {"id": "b", "text": "second"}]"#;
         let items = parse_batch_items(raw).unwrap();
-        // Neither item set restore_punctuation or include_embedding --
-        // both default to (true, false).
+        // Neither item set restore_punctuation or include_embedding -- both default to (true, false).
         assert_eq!(
             items,
             vec![
@@ -1068,18 +906,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // real model load attempt (network/cache), same convention as semantic_dedup.rs's own real-model tests
+    #[ignore] // real model load attempt (network/cache)
     fn ensure_dedup_loaded_reuses_the_same_cache_across_calls() {
-        // Proves the cache slot is actually threaded through and not
-        // silently re-created on a second call. A failed load (no
-        // network) still exercises the "don't retry a known-failed
-        // load" path correctly either way.
+        // Proves the cache slot is threaded through, not silently re-created on a second call, whether the first load succeeded or failed.
         let mut cache: Option<SemanticDedup> = None;
         let first = ensure_dedup_loaded(&mut cache);
         let first_was_ok = first.is_ok();
-        // Second call must not re-attempt the load if the first failed
-        // (cache stays None, not re-tried) or must reuse the same
-        // instance if it succeeded (cache stays Some).
         let second = ensure_dedup_loaded(&mut cache);
         assert_eq!(second.is_ok(), first_was_ok);
     }
@@ -1136,12 +968,7 @@ mod tests {
 
     #[test]
     fn real_read_tool_shaped_input_gets_its_line_numbers_stripped_before_routing() {
-        // Real shape captured from governator-proxy's Step 2 live-API
-        // check: Claude Code's real Read tool numbers every line
-        // `N\t<content>`, which used to route to ContentKind::Other("tsv")
-        // (Magika misreading the tab-separated shape) and get zero real
-        // compression. This is the real end-to-end regression guard, not
-        // just line_number_strip.rs's own isolated unit tests.
+        // Claude Code's Read tool numbers every line `N\t<content>`, which used to route to ContentKind::Other("tsv") and get zero real compression -- end-to-end regression guard.
         let lines: Vec<String> = (1..=30)
             .map(|i| format!("routine status line number {i} with no special structure at all"))
             .collect();
@@ -1263,9 +1090,7 @@ mod tests {
 
     #[test]
     fn adversarial_content_survives_json_round_trip() {
-        // Embedded quotes, backslashes, control characters — the exact
-        // class of input hand-rolled `format!("{:?}", ...)` escaping was
-        // never verified against a real JSON parser for.
+        // Embedded quotes, backslashes, control characters -- never verified against a real JSON parser under hand-rolled escaping.
         let input = "line one\n\"quoted\"\tand a \\backslash\\ and more prose to clear \
             the plain-text threshold so dedup runs and this string round-trips through \
             the actual compression path rather than a trivial passthrough, which is the \

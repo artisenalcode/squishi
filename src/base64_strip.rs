@@ -1,33 +1,14 @@
-//! Deterministic base64-blob stripping — a zero-model pre-pass, not a new
-//! `ContentKind`. A base64 blob (an embedded screenshot, a data-URI in
-//! HTML/JSON) can appear inside any shape squishi detects — JSON, logs,
-//! diffs, plain text — so it's stripped unconditionally before `detect()`
-//! runs, the same way MCE's `Layer1Pruner` runs before its shape-aware
-//! Layer 2 (found auditing `~/Code/_labs/audit-repos/MCE`, 2026-08-07).
+//! Deterministic base64-blob stripping -- a zero-model pre-pass, not a new `ContentKind`. A base64 blob (an embedded screenshot, a data-URI) can appear inside any shape squishi detects, so it's stripped unconditionally before `detect()` runs.
 //!
-//! No dependency on lookaround (Rust's `regex` crate doesn't support it,
-//! unlike the Python `re` MCE's own pattern uses) — not needed here:
-//! requiring a minimum length via `{100,}` already makes greedy matching
-//! consume the maximal contiguous base64-alphabet run on its own.
+//! No lookaround needed: requiring a minimum length via `{100,}` already makes greedy matching consume the maximal contiguous base64-alphabet run.
 
 use regex::Regex;
 use std::sync::LazyLock;
 
-/// Minimum run length inside an already-identified `data:...;base64,`
-/// blob — the `data:` prefix itself is the high-confidence signal here,
-/// so this only needs to rule out a degenerate near-empty payload, not
-/// guard against false positives the way the standalone threshold does.
+/// Minimum run length inside an already-identified `data:...;base64,` blob -- the `data:` prefix is the high-confidence signal, so this only rules out a degenerate near-empty payload.
 const MIN_DATA_URI_INNER_CHARS: usize = 20;
 
-/// Minimum run length for a *standalone* (unprefixed) base64-alphabet
-/// run — much higher than the data-URI inner minimum, and higher than
-/// the original 100 this started at. Real measurement (calibration
-/// probe, 2026-08-07): a real JWT's base64url payload segment (203
-/// chars, no `data:` prefix to disambiguate it) matched and got wrongly
-/// stripped at 100. Real image blobs run into the thousands of chars;
-/// real JWTs are typically well under 500. 500 separates the two in
-/// practice without being able to guarantee it in every case — a real,
-/// reasoned tradeoff, not a proof.
+/// Minimum run length for a standalone (unprefixed) base64-alphabet run. A real JWT payload segment (203 chars, no `data:` prefix) got wrongly stripped at 100; real image blobs run into the thousands of chars, real JWTs are typically well under 500 -- a reasoned tradeoff, not a guarantee.
 const MIN_STANDALONE_BLOB_CHARS: usize = 500;
 
 static DATA_URI_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -47,9 +28,7 @@ fn marker(matched_len: usize) -> String {
     format!("[... squishi pruned: base64 blob removed, {matched_len} chars ...]")
 }
 
-/// Strip base64 blobs from `text`, returning `(stripped_text,
-/// blobs_removed)`. Data-URI blobs are matched first (more specific,
-/// higher-confidence), then any remaining standalone base64 runs.
+/// Strip base64 blobs from `text`, returning `(stripped_text, blobs_removed)`. Data-URI blobs are matched first, then any remaining standalone runs.
 pub fn strip_base64_blobs(text: &str) -> (String, usize) {
     let mut removed = 0;
 
@@ -81,7 +60,7 @@ mod tests {
 
     #[test]
     fn a_real_data_uri_gets_replaced_with_one_marker() {
-        // A real (small, valid) base64-encoded 1x1 PNG data URI.
+        // A small, valid base64-encoded 1x1 PNG data URI.
         let data_uri = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
         let content = format!("here is an image: {data_uri} end of message");
         let (result, removed) = strip_base64_blobs(&content);
@@ -94,7 +73,7 @@ mod tests {
 
     #[test]
     fn a_standalone_long_base64_run_gets_replaced() {
-        let blob = "A".repeat(500); // at the real MIN_STANDALONE_BLOB_CHARS threshold
+        let blob = "A".repeat(500); // at MIN_STANDALONE_BLOB_CHARS
         let content = format!("payload: {blob} done");
         let (result, removed) = strip_base64_blobs(&content);
         assert_eq!(removed, 1);
@@ -110,11 +89,7 @@ mod tests {
         assert_eq!(result, content);
     }
 
-    /// Real regression (calibration probe, 2026-08-07): a real JWT's
-    /// base64url payload segment (203 chars, no `data:` prefix) matched
-    /// and got wrongly stripped at the original 100-char threshold. This
-    /// pins that specific real fixture as a permanent regression test,
-    /// not just a one-off probe run.
+    /// Regression: a JWT's base64url payload segment (203 chars, no `data:` prefix) got wrongly stripped at the original 100-char threshold.
     #[test]
     fn a_real_jwt_payload_segment_is_not_mistaken_for_a_blob() {
         let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.\

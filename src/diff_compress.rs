@@ -1,24 +1,13 @@
-//! Unified-diff compression: cap file count and hunks-per-file, trim
-//! context lines around each change, keep the highest-signal hunks when a
-//! file has too many.
+//! Unified-diff compression: cap file count and hunks-per-file, trim context lines around each change, keep the highest-signal hunks when a file has too many.
 //!
-//! Own implementation, not a byte-parity port — arrived at after reading
-//! headroom's `DiffCompressor` (`crates/headroom-core/src/transforms/
-//! diff_compressor.rs`) to understand the mechanism (parse → score →
-//! cap files → cap hunks/file → trim context → format), then
-//! reimplementing the same shape in plain Rust, dropping the CCR
-//! cache/retrieve-marker machinery entirely — squishi has no store,
-//! that's total-recall's job (see README's Boundary section).
+//! squishi has no store (that's total-recall's job), so this drops any cache/retrieve-marker machinery a fuller port might carry.
 
 use regex::Regex;
 use std::collections::BTreeSet;
 use std::sync::LazyLock;
 
 // ─── Scoring constants ──────────────────────────────────────────────────
-// Same weights headroom uses (its own doc comment: "defaults match the
-// Python implementation byte-for-byte") — kept as a reasonable starting
-// point, not re-derived from squishi's own traffic. Revisit after seeing
-// real compression behavior, not before.
+// A reasonable starting point, not derived from squishi's own traffic. Revisit after seeing real compression behavior.
 
 const SCORE_CHANGE_DENSITY_WEIGHT: f64 = 0.03;
 const SCORE_CHANGE_DENSITY_CAP: f64 = 0.3;
@@ -300,8 +289,7 @@ fn reduce_context(hunk: &DiffHunk, max_context: usize) -> DiffHunk {
         let hi = (pos + max_context + 1).min(hunk.lines.len());
         keep.extend((pos + 1)..hi);
     }
-    // Always keep structural markers like `\ No newline at end of file`
-    // regardless of distance from a change.
+    // Always keep structural markers like `\ No newline at end of file` regardless of distance from a change.
     for (i, line) in hunk.lines.iter().enumerate() {
         if line.starts_with('\\') {
             keep.insert(i);
@@ -397,9 +385,7 @@ pub fn compress_diff(
     let parsed = parse_diff(&lines);
     let mut files = parsed.files;
 
-    // Nothing recognizable as a diff — pass through unchanged rather than
-    // emit an empty result (matches log_compress's convention: no signal,
-    // no compression).
+    // Nothing recognizable as a diff -- pass through unchanged rather than emit an empty result.
     if files.is_empty() {
         return DiffCompressResult {
             content: content.to_string(),

@@ -1,53 +1,19 @@
-//! Per-label thresholds, low-confidence fallbacks, and canonicalization
-//! ("overwrite") targets for magika's real `standard_v3_3` model —
-//! ported (not depended on) from google/magika's own
-//! `rust/lib/src/{model,content}.rs` (Apache-2.0), machine-extracted
-//! 2026-08-18 by matching each of the model's 214 `Label` variants
-//! against `ContentType`'s own threshold/overwrite tables and
-//! per-type `TypeInfo.label`/`is_text` by variant name (not position —
-//! `ContentType` interleaves three extra pseudo-types, Empty/Undefined/
-//! Unknown, that the model itself never predicts, which shifts index
-//! arithmetic if you don't match by name).
+//! Per-label thresholds, low-confidence fallbacks, and canonicalization ("overwrite") targets for magika's `standard_v3_3` model -- ported (not depended on) from google/magika's own Rust source (Apache-2.0), matched by variant name rather than position since `ContentType` interleaves three pseudo-types the model never predicts.
 //!
-//! Ported instead of depended-on because the upstream `magika` crate
-//! hard-pins `ort`, which is the entire reason for this migration — see
-//! `content_detect.rs`'s module doc comment and
-//! `docs/ideation/ort-dependency-consistency/2026-08-18-ort-pin-and-bottleneck-plan.md`.
-//! This table is pure data (no ort, no candle) so it carries none of that
-//! risk forward.
-//!
-//! Order is the model's raw output-tensor order: index `i` here is the
-//! label for output column `i` of the `"target_label"` tensor. Verified
-//! this round-trips correctly against the real model — a rust-source
-//! sample scores highest at the "rust" row and clears its 0.5 threshold
-//! (real score 0.9999454), matching the real magika CLI exactly.
+//! Order is the model's raw output-tensor order: index `i` is the label for output column `i` of the `"target_label"` tensor. Verified against the real model: a rust-source sample scores highest at the "rust" row and clears its threshold, matching the real magika CLI.
 
 pub(crate) struct MagikaLabel {
-    /// The label magika reports when this class wins and clears
-    /// `threshold` with no overwrite in play (e.g. "rust", "html").
+    /// The label magika reports when this class wins and clears `threshold` with no overwrite in play.
     pub(crate) label: &'static str,
-    /// Per-class confidence threshold below which magika reports
-    /// `low_confidence_label` instead of trusting the raw prediction.
-    /// Almost all classes share the generic 0.5; a handful of
-    /// text-ish/rare classes (markdown 0.75; crt/handlebars/ocaml/r/
-    /// rst/sql/tsv/zig 0.9; ignorefile/latex/pascal 0.95) need more
-    /// evidence before magika commits to them over plain text.
+    /// Per-class confidence threshold below which magika reports `low_confidence_label` instead. Most classes share 0.5; a handful of text-ish/rare classes need more evidence (markdown 0.75; several others 0.9-0.95).
     pub(crate) threshold: f32,
-    /// What magika reports instead when the score is below `threshold`:
-    /// "txt" for text-like classes, "unknown" for binary ones.
+    /// What magika reports when the score is below `threshold`: "txt" for text-like classes, "unknown" for binary ones.
     pub(crate) low_confidence_label: &'static str,
-    /// Some(label) when magika always canonicalizes this class to a
-    /// different reported label regardless of score — real examples are
-    /// "randombytes"->"unknown" and "randomtxt"->"txt" (synthetic
-    /// training classes, never a real reported label). None means
-    /// report `label` as-is once `threshold` is cleared.
+    /// Some(label) when magika always canonicalizes this class to a different reported label regardless of score (e.g. synthetic training classes "randombytes"/"randomtxt"). None reports `label` as-is.
     pub(crate) overwrite_label: Option<&'static str>,
 }
 
-// One row per line, not rustfmt's expanded-struct-literal default —
-// matches how upstream magika formats its own dense per-label tables
-// (rust/lib/src/model.rs's THRESHOLDS/OVERWRITE_MAP), and 214 five-line
-// blocks would make this much harder to scan/diff than 214 one-liners.
+// One row per line, not rustfmt's expanded-struct-literal default -- 214 five-line blocks would be much harder to scan/diff.
 #[rustfmt::skip]
 pub(crate) static MAGIKA_LABELS: [MagikaLabel; 214] = [
     MagikaLabel { label: "3gp", threshold: 0.5, low_confidence_label: "unknown", overwrite_label: None },

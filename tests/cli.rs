@@ -1,9 +1,4 @@
-//! Black-box tests against the actual compiled binary — the real
-//! deployable artifact governator's `squishi.rs` wrapper shells out to,
-//! and the same binary a harness skill invokes. Unit tests in
-//! `src/main.rs::route` cover the routing logic; these cover the thing
-//! an actual consumer depends on: argv/stdin in, stdout out, in both
-//! output modes.
+//! Black-box tests against the actual compiled binary, the same one governator's `squishi.rs` wrapper and a harness skill invoke. Unit tests in `src/main.rs::route` cover routing logic; these cover argv/stdin in, stdout out.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -55,9 +50,7 @@ fn plain_prose_dedups_and_reports_char_counts() {
     let value = run("just a short paragraph of prose with no special structure.");
     assert_eq!(value["kind"], "PlainText");
     assert_eq!(value["source"], "dedup");
-    // line_dedup normalizes a trailing newline onto short content, so
-    // chars_after can be chars_before + 1 — not a compression regression,
-    // just confirming the char counts are real and in the right ballpark.
+    // line_dedup normalizes a trailing newline onto short content, so chars_after can be chars_before + 1 -- not a regression.
     let before = value["chars_before"].as_u64().unwrap();
     let after = value["chars_after"].as_u64().unwrap();
     assert!(after <= before + 1);
@@ -65,8 +58,7 @@ fn plain_prose_dedups_and_reports_char_counts() {
 
 #[test]
 fn adversarial_content_round_trips_as_valid_json() {
-    // Embedded quotes, backslashes, newlines — the exact class of input
-    // hand-rolled string formatting is easy to get subtly wrong on.
+    // Embedded quotes, backslashes, newlines -- easy to get subtly wrong with hand-rolled string formatting.
     let value = run("a line\n\"quoted\"\tand a \\backslash\\ in it");
     assert!(value["compressed"].as_str().unwrap().contains("quoted"));
 }
@@ -83,9 +75,7 @@ fn rust_source_is_classified_as_other() {
 
 #[test]
 fn default_output_is_bare_compressed_text_not_json() {
-    // The harness-facing default: no --json, positional arg. stdout
-    // should be exactly the compressed text, nothing else — not a JSON
-    // object a caller has to parse just to get the content back out.
+    // stdout should be exactly the compressed text, not a JSON object a caller has to parse.
     let output = Command::new(env!("CARGO_BIN_EXE_squishi"))
         .arg("just a short paragraph of prose with no special structure.")
         .output()
@@ -332,7 +322,7 @@ fn batch_mode_rejects_malformed_stdin_with_a_clear_error() {
     assert!(stderr.contains("--batch"));
 }
 
-// --- --session-digest --start-line (ADR-0006 Phase 2) ---
+// --- --session-digest --start-line ---
 
 fn run_session_digest(transcript_path: &std::path::Path, start_line: usize) -> serde_json::Value {
     let output = Command::new(env!("CARGO_BIN_EXE_squishi"))
@@ -355,10 +345,7 @@ fn run_session_digest(transcript_path: &std::path::Path, start_line: usize) -> s
         .unwrap_or_else(|e| panic!("stdout was not valid JSON ({e}): {stdout:?}"))
 }
 
-/// The real incremental contract: a second call using the first call's
-/// own `total_lines` as `--start-line` returns only the delta, and that
-/// delta is a strict suffix of what a whole-file (`--start-line 0`) call
-/// against the same, now-longer transcript would produce.
+/// A second call using the first call's own `total_lines` as `--start-line` returns only the delta, a strict suffix of what a whole-file call against the same, now-longer transcript would produce.
 #[test]
 fn start_line_from_a_prior_calls_total_lines_yields_a_strict_suffix() {
     let tmp = tempfile::tempdir().unwrap();
@@ -386,9 +373,7 @@ fn start_line_from_a_prior_calls_total_lines_yields_a_strict_suffix() {
     assert!(!incremental_content.contains("first real question"));
 }
 
-/// An incremental call that lands on a transcript with nothing new since
-/// the checkpoint must succeed (exit 0, valid JSON with total_lines) --
-/// NOT the "empty session" hard failure a whole-file call still gets.
+/// An incremental call landing on a transcript with nothing new since the checkpoint must succeed, not hit the "empty session" hard failure a whole-file call still gets.
 #[test]
 fn start_line_with_nothing_new_succeeds_instead_of_failing() {
     let tmp = tempfile::tempdir().unwrap();
@@ -399,15 +384,13 @@ fn start_line_with_nothing_new_succeeds_instead_of_failing() {
     let first = run_session_digest(&path, 0);
     let total_lines = first["total_lines"].as_u64().unwrap();
 
-    // Same file, no new lines appended -- start_line == total_lines.
+    // Same file, no new lines appended.
     let second = run_session_digest(&path, total_lines as usize);
     assert_eq!(second["turn_count"], 0);
     assert_eq!(second["total_lines"], total_lines);
 }
 
-/// Regression: a truly empty whole-file digest (start_line 0, no real
-/// content anywhere) must still fail loudly -- Phase 2 only relaxed the
-/// empty-result check for incremental (start_line > 0) calls.
+/// A truly empty whole-file digest must still fail loudly -- only incremental (start_line > 0) calls relax the empty-result check.
 #[test]
 fn start_line_zero_on_a_genuinely_empty_session_still_fails() {
     let tmp = tempfile::tempdir().unwrap();
@@ -469,18 +452,7 @@ fn toon_rejects_non_json_input_with_a_clear_error() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("requires valid JSON"));
 }
 
-/// The real end-to-end proof: whatever `--toon` actually decided for
-/// genuinely messy real production data (a snapshot of graphify's own
-/// graph.json nodes, confirmed non-uniform across several distinct field
-/// shapes), the result recovers the exact original value. Doesn't assume
-/// TOON wins here -- it may honestly decline (`toon-not-smaller`) for
-/// data this irregular, and the test checks whichever path was actually
-/// taken, not a guessed one.
-///
-/// Piped over stdin rather than passed as a CLI arg: the fixture is
-/// ~180KB, past Linux's ~128KB single-argument execve limit
-/// (MAX_ARG_STRLEN), which real large inputs must go through stdin to
-/// avoid anyway.
+/// Genuinely messy production data (graphify's own graph.json nodes) round-trips exactly, whichever path `--toon` actually took (it may decline as `toon-not-smaller` for irregular data). Piped over stdin, not passed as a CLI arg: the fixture is ~180KB, past Linux's ~128KB execve argument limit.
 #[test]
 fn toon_round_trips_real_graph_json_through_the_binary() {
     let nodes_json = std::fs::read_to_string(concat!(
@@ -531,7 +503,6 @@ fn generate_man_writes_a_real_man_page_and_leaves_no_other_output() {
 
     let man_path = out_dir.path().join("squishi.1");
     let contents = std::fs::read_to_string(&man_path).unwrap();
-    // Real roff(7) man page markers, not just "some file got written" --
     // roff escapes hyphens as `\-`, so a documented flag reads `\-\-toon`.
     assert!(
         contents.contains(".TH squishi"),

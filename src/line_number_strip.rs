@@ -1,48 +1,18 @@
-//! Deterministic Read-tool line-number stripping — a zero-model pre-pass,
-//! not a new `ContentKind`, mirroring `base64_strip.rs`'s own shape and
-//! reasoning: run unconditionally before `detect()`, since this shape can
-//! wrap any real content underneath it.
+//! Deterministic Read-tool line-number stripping -- a zero-model pre-pass, not a new `ContentKind`, run unconditionally before `detect()` since this shape can wrap any real content underneath it.
 //!
-//! Real finding, from governator-proxy's Step 2 live-API check
-//! (`docs/ideation/governator-proxy/2026-08-18-transparent-proxy-step2-spec.md`):
-//! Claude Code's real `Read` tool formats file content `cat -n`-style,
-//! `<N>\t<line content>` per line, no padding (confirmed against a real
-//! captured tool_result). Squishi previously ran `detect()` and every
-//! compressor directly on that shape — real, live consequence: Magika
-//! classified it as `Other("tsv")` (a kind squishi has no compressor
-//! for), and even the fast-path regexes (Json/SearchResults/Diff/Log, all
-//! anchored at line start) would misfire, since a real diff header or log
-//! keyword on line N never starts the line once `"N\t"` is in front of
-//! it. Confirmed directly on real data: the same real content compressed
-//! 9290→9291 chars (no reduction) with the prefix present, 8910→121 chars
-//! with it stripped. `Read` is Claude Code's single most common tool
-//! call, so this is real, live-traffic-shaped impact, not a synthetic
-//! edge case.
+//! Claude Code's `Read` tool formats file content `cat -n`-style, `<N>\t<line content>` per line. Left unstripped, Magika classifies it as `Other("tsv")` (no compressor for that) and even the fast-path regexes misfire since a diff header or log keyword on line N no longer starts the line once `"N\t"` is in front of it. Measured on real data: 9290→9291 chars (no reduction) with the prefix present, 8910→121 stripped.
 //!
-//! Detection requires **strictly sequential numbering from 1**, not just
-//! "every line starts with digits+tab" — the real, specific signature of
-//! `cat -n`-style output, and a much narrower bar than a loose prefix
-//! match. A genuine numbered-ID-column TSV would need to coincidentally
-//! number every row `1..N` matching the real line count exactly to be
-//! mistaken for this — and even then, stripping a redundant leading
-//! sequence column loses no real information, since row order already
-//! carries it.
+//! Detection requires strictly sequential numbering from 1, not just "every line starts with digits+tab" -- a genuine numbered-ID-column TSV would need to coincidentally number every row `1..N` to be mistaken for this, and even then stripping a redundant leading sequence column loses no real information.
 
 use regex::Regex;
 use std::sync::LazyLock;
 
 static LINE_NUMBER_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(\d+)\t").unwrap());
 
-/// Below this many lines, a match is too easy to hit by pure coincidence
-/// (e.g. a real "1\tfoo" is a completely ordinary thing for a line of
-/// text to start with) to trust as real Read-tool output.
+/// Below this many lines, a match is too easy to hit by pure coincidence to trust as real Read-tool output.
 const MIN_LINES: u64 = 5;
 
-/// Strips a real Read-tool-shaped `N\t` prefix from every line if (and
-/// only if) every line in `text` matches it with strictly sequential
-/// numbers starting at 1 — otherwise returns `text` completely unchanged.
-/// Never a partial strip: any line that breaks the pattern means nothing
-/// is touched.
+/// Strips a Read-tool-shaped `N\t` prefix from every line only if every line matches it with strictly sequential numbers starting at 1 -- otherwise returns `text` completely unchanged, never a partial strip.
 pub fn strip_read_tool_line_numbers(text: &str) -> (String, bool) {
     let lines: Vec<&str> = text.lines().collect();
 
@@ -114,10 +84,7 @@ mod tests {
 
     #[test]
     fn a_gap_in_the_sequence_leaves_content_completely_untouched() {
-        // Real lines 1-5, then jumps to 7 -- not real Read-tool output
-        // (a genuine gap would mean a mid-file edit or a different
-        // source entirely), so nothing should be stripped, not even the
-        // lines that *do* match.
+        // Lines 1-5, then jumps to 7 -- not real Read-tool output, so nothing should be stripped, not even the lines that do match.
         let mut text = numbered(&["a", "b", "c", "d", "e"]);
         text.push_str("7\tf\n");
         let (result, stripped) = strip_read_tool_line_numbers(&text);
@@ -127,8 +94,7 @@ mod tests {
 
     #[test]
     fn too_few_lines_is_not_trusted_as_real_read_tool_output() {
-        // "1\tfoo\n2\tbar\n" is a completely ordinary thing for real text
-        // to contain by coincidence -- must not fire on a tiny match.
+        // "1\tfoo\n2\tbar\n" is ordinary enough to occur by coincidence -- must not fire on a tiny match.
         let text = numbered(&["foo", "bar"]);
         let (result, stripped) = strip_read_tool_line_numbers(&text);
         assert!(!stripped);
@@ -137,11 +103,7 @@ mod tests {
 
     #[test]
     fn a_real_numbered_tsv_id_column_that_happens_to_be_sequential_still_strips_safely() {
-        // The real, narrow false-positive case named in this module's own
-        // doc comment: genuine tab-separated data whose leading ID column
-        // happens to be exactly 1..N. Stripping it loses no real
-        // information (row order already carries the same sequence), so
-        // this is documented as an acceptable, safe outcome, not a bug.
+        // Genuine TSV whose leading ID column happens to be exactly 1..N. Stripping loses no real information (row order already carries the sequence) -- a safe outcome, not a bug.
         let mut text = String::new();
         for i in 1..=8 {
             text.push_str(&format!("{i}\tvalue-{i}\n"));
@@ -169,10 +131,7 @@ mod tests {
 
     #[test]
     fn real_captured_shape_with_an_embedded_fact_survives_intact() {
-        // Real regression fixture, matching this module's own doc
-        // comment: the exact shape captured from a real governator-proxy
-        // live-API check, confirming the embedded fact a caller might
-        // later need to recall isn't corrupted by stripping.
+        // Confirms an embedded fact a caller might need to recall isn't corrupted by stripping.
         let mut lines: Vec<String> = (1..=60)
             .map(|i| format!("log line {i:03}: routine status check, all systems nominal"))
             .collect();

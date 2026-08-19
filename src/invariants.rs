@@ -1,36 +1,11 @@
-//! Verified-fact elision markers: when a compressor drops units, state
-//! only what's actually true about the dropped set instead of a bare
-//! count -- a constant field, a small enumerated value-count breakdown,
-//! a numeric range from real original value strings, or identifier
-//! coverage. Withholds entirely, never partially, when nothing meets the
-//! bar -- a partial disclosure reads as complete and is worse than none.
+//! Verified-fact elision markers: when a compressor drops units, state only what's actually true about the dropped set instead of a bare count. Withholds entirely, never partially, when nothing meets the bar -- a partial disclosure reads as complete and is worse than none.
 //!
-//! Ports the SHAPE of this from caveman's own `engine/CLAUDE.md`-documented
-//! `invariants.go` (a different, BSL-licensed codebase) -- not the code,
-//! the rules, after caveman's own measured regressions from getting this
-//! wrong: an agent made 46 sequential retrieve calls chasing a dead
-//! pointer, and another reported 5 unfulfilled orders where there were 3,
-//! from a marker that didn't say which field varied.
-//!
-//! Decision order per field (first match wins): constant value across
-//! every unit that has it -> state once. Else all present values parse
-//! as numbers -> a range, printed from the real ORIGINAL value strings
-//! (never a reparsed/renormalized number -- see json_compress.rs's use
-//! of `raw_value` for why this matters). Else every present value is
-//! distinct (identifier-shaped) -> state coverage (distinct count +
-//! byte-wise min/max), or verified full membership if the values are
-//! counted -- not inferred -- to be exactly dense. Else, if the distinct
-//! count is small and every value is safe to print (no spaces, not too
-//! long, not a credential-shaped field name) -> a full enumeration with
-//! an `absent×N` bucket. Otherwise the field is withheld entirely.
+//! Decision order per field (first match wins): constant across every unit that has it -> state once. Else all present values parse as numbers -> a range, printed from the real ORIGINAL value strings, never a reparsed/renormalized number. Else every present value is distinct (identifier-shaped) -> coverage (distinct count + byte-wise min/max), or verified full membership if counted to be exactly dense. Else, if distinct count is small and every value is safe to print -> a full enumeration with an `absent×N` bucket. Otherwise withheld entirely.
 
 use regex::Regex;
 use std::sync::LazyLock;
 
-/// One dropped unit's fields, as (name, original-formatted value text)
-/// pairs. Callers must supply real source text, never a
-/// reparsed/renormalized value -- a JSON `5.00` silently becoming `5.0`
-/// on reserialization would make a range marker lie about the source.
+/// One dropped unit's fields, as (name, original-formatted value text) pairs. Callers must supply real source text, never a reparsed/renormalized value -- `5.00` silently becoming `5.0` would make a range marker lie about the source.
 pub struct Unit {
     pub fields: Vec<(String, String)>,
 }
@@ -49,15 +24,11 @@ impl Unit {
 }
 
 pub struct InvariantConfig {
-    /// A varying, non-identifier field with more distinct values than
-    /// this is withheld entirely rather than partially enumerated.
+    /// A varying, non-identifier field with more distinct values than this is withheld entirely rather than partially enumerated.
     pub max_enum_values: usize,
-    /// A value at or over this many bytes withholds its whole field from
-    /// enumeration -- a long value reads as content, not a safe label.
+    /// A value at or over this many bytes withholds its whole field -- a long value reads as content, not a safe label.
     pub max_value_len: usize,
-    /// Flat cap on the whole disclosure suffix appended to the existing
-    /// bare marker. Deliberately a flat cutoff for v1, not caveman's
-    /// multi-tier byte-shedding system -- see the spec's Risks section.
+    /// Flat cap on the disclosure suffix appended to the bare marker.
     pub max_marker_bytes: usize,
 }
 
@@ -100,16 +71,13 @@ enum Fact {
     },
 }
 
-/// `None` means nothing survived disclosure -- the caller keeps its
-/// existing bare "N omitted" marker unchanged. Never returns a marker
-/// that looks enriched but claims nothing.
+/// `None` means nothing survived disclosure -- the caller keeps its bare "N omitted" marker unchanged.
 pub fn describe(units: &[Unit], config: &InvariantConfig) -> Option<String> {
     if units.is_empty() {
         return None;
     }
 
-    // Union of field names across all units, first-seen order, for
-    // deterministic output.
+    // Union of field names across all units, first-seen order, for deterministic output.
     let mut field_names: Vec<&str> = Vec::new();
     for u in units {
         for (k, _) in &u.fields {
@@ -155,13 +123,7 @@ pub fn describe(units: &[Unit], config: &InvariantConfig) -> Option<String> {
 }
 
 fn analyze_field(field: &str, units: &[Unit], config: &InvariantConfig) -> Option<Fact> {
-    // Credential-shaped field NAMES are withheld regardless of value
-    // shape -- checked first, before any classification, so a numeric
-    // `session_id` can't sneak out as a range and a long-valued
-    // `auth_token` can't sneak out as coverage. The value-length/space
-    // checks further down (enumeration, coverage) are the complementary
-    // half of this: a safe-sounding field name with unsafe-looking
-    // VALUES is caught there instead.
+    // Credential-shaped field NAMES are withheld regardless of value shape, checked before any classification, so a numeric `session_id` can't sneak out as a range.
     if CREDENTIAL_FIELD_RE.is_match(field) {
         return None;
     }
@@ -179,12 +141,7 @@ fn analyze_field(field: &str, units: &[Unit], config: &InvariantConfig) -> Optio
         }
     }
 
-    // Constant, but ONLY when every unit has the field -- a single value
-    // seen in 1 of 3 units is not safe to state as a bare "field=value",
-    // since that reads as a universal claim about all dropped units. With
-    // any absences, the same fact falls through to the enumeration path
-    // below, which states the absent count explicitly instead of hiding
-    // it (e.g. "region: us-east×1 absent×2", not "region=us-east").
+    // Constant, but ONLY when every unit has the field -- a value seen in 1 of 3 units would read as a universal claim about all dropped units. With any absences, this falls through to enumeration instead, which states the absent count explicitly.
     if absent == 0 && distinct_vals.len() == 1 {
         return Some(Fact::Constant {
             field: field.to_string(),
@@ -192,10 +149,7 @@ fn analyze_field(field: &str, units: &[Unit], config: &InvariantConfig) -> Optio
         });
     }
 
-    // All present values numeric? -> range, printed from the real
-    // original strings, not the parsed f64. A range only ever claims
-    // something about the values it actually saw, so absences don't
-    // create the same completeness risk a bare constant would.
+    // All present values numeric? -> range, printed from the real original strings, not the parsed f64. A range only claims about values it actually saw, so absences don't create the same risk a bare constant would.
     if let Some(nums) = present
         .iter()
         .map(|v| v.parse::<f64>().ok())
@@ -218,24 +172,13 @@ fn analyze_field(field: &str, units: &[Unit], config: &InvariantConfig) -> Optio
         });
     }
 
-    // Distinct-per-unit (identifier-shaped)? Requires MORE present units
-    // than the enumeration cap allows -- with few units, every varying
-    // field trivially has "every value distinct" (2 units can't help but
-    // have 2 distinct values), which would wrongly steal small cases
-    // enumeration already handles exactly and more precisely. Coverage
-    // is specifically for the case enumeration ISN'T safe for: too many
-    // identifiers to list. Same reasoning as range on absences: "N
-    // distinct values seen" doesn't imply anything about absent units.
+    // Distinct-per-unit (identifier-shaped)? Requires MORE present units than the enumeration cap allows -- with few units, every varying field trivially has "every value distinct", which would wrongly steal cases enumeration handles more precisely. Coverage is for when enumeration isn't safe: too many identifiers to list.
     if distinct_vals.len() == present.len() && present.len() > config.max_enum_values {
         let mut sorted = distinct_vals.clone();
         sorted.sort_unstable();
         let min = *sorted.first().unwrap();
         let max = *sorted.last().unwrap();
-        // Coverage shows these two values verbatim -- if either reads
-        // more like content than a short identifier (long, or contains a
-        // space), don't disclose this field at all. Same safety bar
-        // enumeration applies to every value it lists; coverage only
-        // shows two, but they're still real disclosed text.
+        // Coverage shows these two values verbatim -- if either reads more like content than a short identifier, don't disclose this field at all.
         let unsafe_extreme = [min, max]
             .iter()
             .any(|v| v.len() >= config.max_value_len || v.contains(' '));
@@ -251,10 +194,7 @@ fn analyze_field(field: &str, units: &[Unit], config: &InvariantConfig) -> Optio
         }
     }
 
-    // Small, safe-to-print enumeration? Covers the single-distinct-value-
-    // with-absences case the constant branch above declined to claim.
-    // The field-name credential check already ran at the top of this
-    // function; only the per-value length/space check applies here.
+    // Small, safe-to-print enumeration? Covers the single-distinct-value-with-absences case the constant branch declined to claim.
     if distinct_vals.len() <= config.max_enum_values {
         let unsafe_value = distinct_vals
             .iter()
@@ -275,15 +215,11 @@ fn analyze_field(field: &str, units: &[Unit], config: &InvariantConfig) -> Optio
         }
     }
 
-    // Doesn't meet the bar for anything safe to say -- withhold this
-    // field entirely, per the module's own "never partial" rule.
+    // Doesn't meet the bar for anything safe to say -- withhold entirely.
     None
 }
 
-/// Best-effort: only detects the common "shared prefix + fixed-width
-/// numeric suffix + contiguous" shape (e.g. `wh-5000`..`wh-5059`), not
-/// every possible dense encoding. Density is counted from the real
-/// parsed values, never inferred from the endpoints alone.
+/// Best-effort: only detects the "shared prefix + fixed-width numeric suffix + contiguous" shape (e.g. `wh-5000`..`wh-5059`). Density is counted from real parsed values, never inferred from endpoints alone.
 fn is_dense(values: &[&str]) -> bool {
     let mut parsed: Vec<(&str, u64, usize)> = Vec::with_capacity(values.len());
     for v in values {
@@ -382,9 +318,7 @@ mod tests {
 
     #[test]
     fn identifier_shaped_field_renders_coverage_not_enumeration() {
-        // 8 distinct order_ids -- above max_enum_values (5), so
-        // enumeration isn't safe; every unit's value is unique, so this
-        // is exactly the case coverage exists for.
+        // 8 distinct order_ids, above max_enum_values (5) and every value unique -- exactly the case coverage exists for.
         let ids = [
             "1003", "1000", "1047", "1012", "1099", "1055", "1071", "1030",
         ];
@@ -407,11 +341,7 @@ mod tests {
 
     #[test]
     fn more_than_max_distinct_non_identifier_field_is_withheld_entirely() {
-        // 7 distinct `status` values across 10 units (so it's NOT
-        // identifier-shaped -- some values repeat), above
-        // max_enum_values (5) -- too many to enumerate safely, and not
-        // uniform enough for coverage. A repeated OTHER field proves the
-        // withheld field is dropped without silencing the whole marker.
+        // 7 distinct `status` values across 10 units (some repeat, so not identifier-shaped), above max_enum_values -- too many to enumerate, not uniform enough for coverage.
         let statuses = [
             "queued", "queued", "running", "running", "done", "failed", "retrying", "queued",
             "done", "paused",
@@ -460,10 +390,7 @@ mod tests {
 
     #[test]
     fn a_credential_shaped_field_name_is_withheld_even_when_numeric() {
-        // Found while wiring this module into json_compress.rs: the
-        // original code only ran the name check inside the enumeration
-        // branch, so a numeric `session_id` would have slipped out as a
-        // range. This is the regression test for that fix.
+        // Regression: the name check originally ran only inside the enumeration branch, so a numeric `session_id` slipped out as a range.
         let units = vec![
             unit(&[("session_id", "1000")]),
             unit(&[("session_id", "2000")]),
@@ -475,9 +402,7 @@ mod tests {
 
     #[test]
     fn coverage_withholds_a_field_whose_extreme_values_are_long_or_spaced() {
-        // Same class of gap as the credential-name one above: coverage
-        // shows two real values (min/max) verbatim -- if either looks
-        // like content rather than a short identifier, don't disclose.
+        // Coverage shows two real values (min/max) verbatim -- if either looks like content, don't disclose.
         let units: Vec<Unit> = (0..10)
             .map(|i| {
                 let value = format!("a fairly long unique blob value number {i}");
@@ -495,11 +420,7 @@ mod tests {
 
     #[test]
     fn a_field_present_in_only_some_units_is_never_stated_as_a_bare_constant() {
-        // Regression guard, found during build: a single value seen in
-        // 1 of 3 units must NOT render as "region=us-east" -- that bare
-        // form reads as a universal claim about every dropped unit. It
-        // must fall through to the enumeration path instead, which
-        // states the absence explicitly.
+        // A value seen in 1 of 3 units must not render as "region=us-east" -- that reads as a universal claim; must fall through to enumeration instead.
         let units = vec![unit(&[("region", "us-east")]), unit(&[]), unit(&[])];
         let marker = describe(&units, &InvariantConfig::default()).unwrap();
         assert!(

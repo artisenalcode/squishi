@@ -1,33 +1,8 @@
-//! Lossless CSV-schema rendering for cleanly tabular JSON arrays.
+//! Lossless CSV-schema rendering for cleanly tabular JSON arrays. Scoped to a flat single-level path only: no bucketing for heterogeneous arrays, no recursion into nested arrays/stringified-JSON, no nested-uniform column flattening, no substitution for long/opaque strings. Any array needing one of those loses out -- `render_csv_schema` returns `None` and the caller falls back to lossy row-selection.
 //!
-//! Ported from headroom's `smart_crusher/compaction/` (`compactor.rs`
-//! for the tabular-uniformity decision, `formatter.rs` for the
-//! `[N]{cols}` CSV rendering), scoped to a flat single-level path only:
-//! no bucketing for heterogeneous arrays, no recursion into nested
-//! arrays/stringified-JSON, no nested-uniform column flattening, no
-//! CCR substitution for long/opaque strings. Any array that would need
-//! one of those to render loses out — `render_csv_schema` returns
-//! `None` and the caller falls back to the existing lossy row-selection
-//! path. See `docs/plan-2026-08-19-smart-crush-port.md` for the scope
-//! decisions and why each cut is safe.
+//! A heterogeneous array with no clean discriminator still renders as a sparse table (missing fields blank) rather than declining outright.
 //!
-//! headroom uses a key-frequency "core ratio" purely to decide whether
-//! to *try* bucketing a heterogeneous array by a discriminator field --
-//! when no clean discriminator is found, it still falls through to a
-//! sparse table rather than declining outright (its own module doc:
-//! "a sparse table is still better than letting the lossy path drop
-//! fields wholesale"). v1 has no bucketing (see the plan), so that
-//! ratio has nothing left to gate: every array that passes the item-
-//! count and all-cells-scalar checks below renders as a table, sparse
-//! or not, exactly like headroom's own no-discriminator fallback.
-//!
-//! Every cell that does render goes out as a real JSON scalar, in full
-//! -- there is no store to point a hash marker at, so nothing here ever
-//! substitutes a placeholder for original bytes. That keeps this path
-//! genuinely lossless (the caller can always compare its byte-savings
-//! ratio honestly), at the cost of not shrinking arrays that lean on
-//! long opaque blobs -- the ≥30% savings gate the caller applies is
-//! what filters those out, not this module.
+//! Every cell that renders goes out as a real JSON scalar in full, keeping this path genuinely lossless -- at the cost of not shrinking arrays that lean on long opaque blobs, which the caller's own savings-ratio gate filters out instead.
 
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -38,13 +13,7 @@ struct FieldSpec {
     nullable: bool,
 }
 
-/// Renders `items` as a `[N]{col:type,...}` header followed by one CSV
-/// row per item, or `None` if the array isn't cleanly tabular: fewer
-/// than 2 items, a non-object item, or a nested/array/stringified-JSON
-/// cell (nothing here can render those without recursion). A key
-/// distribution that's uneven across rows still renders -- as a sparse
-/// table, missing fields blank -- rather than declining; see the
-/// module doc for why that matches headroom's own fallback.
+/// Renders `items` as a `[N]{col:type,...}` header followed by one CSV row per item, or `None` if the array isn't cleanly tabular: fewer than 2 items, a non-object item, or a nested/array/stringified-JSON cell.
 pub fn render_csv_schema(items: &[Value]) -> Option<String> {
     if items.len() < 2 {
         return None;
@@ -109,8 +78,7 @@ pub fn render_csv_schema(items: &[Value]) -> Option<String> {
     Some(out)
 }
 
-/// Everything that isn't an object or array. `Value::Null` is scalar
-/// (an absent/nullable field), matching headroom's `CellClass::Scalar`.
+/// Everything that isn't an object or array. `Value::Null` is scalar (an absent/nullable field).
 fn is_scalar(v: &Value) -> bool {
     !matches!(v, Value::Object(_) | Value::Array(_))
 }
@@ -165,8 +133,7 @@ fn json_scalar_to_csv(v: &Value) -> String {
                 s.clone()
             }
         }
-        // Object/array is unreachable -- render_csv_schema's is_scalar
-        // check already declined the whole array before reaching here.
+        // Object/array is unreachable -- is_scalar already declined the whole array.
         _ => csv_quote(&serde_json::to_string(v).unwrap_or_default()),
     }
 }
@@ -290,8 +257,7 @@ mod tests {
 
     #[test]
     fn long_string_cell_renders_verbatim_not_substituted() {
-        // No CCR store -- a long string is not opaque-substituted here,
-        // it renders in full. Losslessness over token savings.
+        // No opaque substitution -- a long string renders in full. Losslessness over token savings.
         let blob = "x".repeat(500);
         let items = vec![
             json!({"id": 1, "blob": blob.clone()}),
@@ -301,11 +267,7 @@ mod tests {
         assert!(out.contains(&blob));
     }
 
-    /// Fields barely overlap across rows -- headroom would try
-    /// discriminator-bucketing here and only fall through to a sparse
-    /// table if no clean discriminator exists. v1 has no bucketing at
-    /// all (see the module doc), so it goes straight to the sparse
-    /// table headroom itself falls back to.
+    /// Fields barely overlap across rows -- no bucketing here, so it goes straight to a sparse table.
     #[test]
     fn heterogeneous_array_renders_as_a_sparse_table() {
         let items = vec![

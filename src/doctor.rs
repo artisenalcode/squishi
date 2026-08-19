@@ -1,20 +1,6 @@
-//! Self-diagnostics — checks this tool's own real failure surface (which
-//! binary is actually running, whether the magika model classifies real
-//! content correctly, where the semantic-dedup model cache resolves to
-//! and whether it's already warm, and a best-effort proxy for whether
-//! the PostToolUse hook has fired recently) and reports pass/warn/fail
-//! per check.
+//! Self-diagnostics: checks which binary is running, whether the magika model classifies real content correctly, where the semantic-dedup model cache resolves to and whether it's warm, and a best-effort proxy for whether the PostToolUse hook has fired recently. Reports pass/warn/fail per check.
 //!
-//! Modeled on `agent-browser doctor` (audited 2026-08-07,
-//! docs/ideation/audit-repo-techniques/2026-08-07-enrichment-techniques.md)
-//! and total-recall's own `doctor` (this session) — same `Check`/`Status`
-//! shape for consistency of *pattern*, not a shared implementation (two
-//! real implementations as of this plan; this project's own "no shared
-//! abstraction before a third real need" convention).
-//!
-//! No `--fix` here (see `docs/plan-2026-08-07-doctor-commands.md`):
-//! squishi has no repairable persistent state — no locks, no bank dirs,
-//! nothing that gets stuck.
+//! No `--fix` here -- squishi has no repairable persistent state, no locks, no bank dirs, nothing that gets stuck.
 
 use crate::semantic_dedup::SemanticDedup;
 use serde_json::{Map, Value};
@@ -57,10 +43,6 @@ impl DoctorReport {
         self.checks.iter().any(|c| c.status == Status::Fail)
     }
 
-    /// Reuses `serde_json` (already a squishi dependency, unlike
-    /// total-recall) rather than hand-rolling escaping — `build_output`'s
-    /// own reasoning for a plain `Map<String, Value>` over a derive macro
-    /// applies here too.
     pub fn to_json(&self) -> Value {
         let checks: Vec<Value> = self
             .checks
@@ -79,11 +61,7 @@ impl DoctorReport {
     }
 }
 
-/// Run every check. `quick` skips the two model-load checks (magika,
-/// semantic-dedup) — mirrors total-recall's own `--quick`. Only
-/// semantic-dedup is genuinely expensive since the 2026-08-18 candle-onnx
-/// migration (real network/disk model fetch); magika's check is cheap
-/// now but stays gated for output stability, see `check_magika_loads`.
+/// Run every check. `quick` skips the two model-load checks (magika, semantic-dedup). Only semantic-dedup is genuinely expensive (real network/disk fetch); magika's check is cheap but stays gated for output stability, see `check_magika_loads`.
 pub fn run(quick: bool) -> DoctorReport {
     let checks = vec![
         check_binary_identity(),
@@ -116,14 +94,7 @@ fn check_binary_identity() -> Check {
     }
 }
 
-/// 2026-08-18: `magika::Session::new()` (ort) replaced by a real
-/// classification through `content_detect::detect()` (candle-onnx) —
-/// see content_detect.rs's module doc comment for why. This check is no
-/// longer expensive to run (the embedded model decodes once, lazily, in
-/// well under a millisecond — no ~111ms `ort::Session` build) but stays
-/// gated behind `--quick` for output stability with the rest of this
-/// function's contract, and because a real classification is still a
-/// stronger signal than "the model bytes decoded."
+/// No longer expensive (the embedded model decodes once, lazily, well under a millisecond) but stays gated behind `--quick` for output stability, and because a real classification is a stronger signal than "the model bytes decoded."
 fn check_magika_loads(quick: bool) -> Check {
     let name = "magika_loads".to_string();
     if quick {
@@ -151,14 +122,7 @@ fn check_magika_loads(quick: bool) -> Check {
     }
 }
 
-/// Reports where `semantic_dedup::SemanticDedup::load`'s `hf_hub::Api::new()`
-/// actually resolves its cache directory to. Real finding from reading the
-/// `hf-hub` source directly (not assumed): `Api::new()` uses
-/// `Cache::default()` (always `~/.cache/huggingface/hub`), NOT
-/// `Cache::from_env()` — `HF_HOME` is silently ignored by the call
-/// squishi actually makes. Surfacing the real resolved path, and that
-/// `HF_HOME` doesn't affect it, is exactly the kind of previously-invisible
-/// information this check exists to give.
+/// Reports where `SemanticDedup::load`'s `hf_hub::Api::new()` actually resolves its cache directory to. `Api::new()` uses `Cache::default()` (always `~/.cache/huggingface/hub`), not `Cache::from_env()` -- `HF_HOME` is silently ignored by the call squishi makes.
 fn check_model_cache_location() -> Check {
     let name = "model_cache_location".to_string();
     let cache_dir = match dirs::home_dir() {
@@ -234,12 +198,7 @@ fn check_semantic_dedup_loads(quick: bool) -> Check {
     }
 }
 
-/// Best-effort proxy signal only — NOT a registration check. This
-/// project's own filed bug (anthropics/claude-code#84439) established
-/// there is no reliable programmatic way to confirm a plugin-registered
-/// PostToolUse hook is actually live. This reports hook-file presence and
-/// a recency proxy (`last-input.json`'s mtime) — explicitly labeled, never
-/// upgraded to sound like a guarantee in either direction.
+/// Best-effort proxy signal only, not a registration check -- there's no reliable programmatic way to confirm a plugin-registered PostToolUse hook is actually live (anthropics/claude-code#84439). Reports hook-file presence and a recency proxy (`last-input.json`'s mtime).
 fn check_hook_proxy_signal() -> Check {
     let name = "hook_proxy_signal".to_string();
     let Some(home) = dirs::home_dir() else {
@@ -384,8 +343,7 @@ mod tests {
 
     #[test]
     fn run_in_quick_mode_never_loads_either_model() {
-        // Real end-to-end: run(true) must complete fast (no model I/O) and
-        // report exactly two Skipped checks among the five.
+        // run(true) must complete fast (no model I/O) and report exactly two Skipped checks among the five.
         let report = run(true);
         assert_eq!(report.checks.len(), 5);
         let skipped = report

@@ -1,95 +1,39 @@
-//! Text-to-image rendering ("pixel-mode"), squishi's port of pxpipe's
-//! technique (github.com/teamchong/pxpipe, MIT) for the Claude model family:
-//! render dense text as a bitmap PNG instead of shipping it as tokens.
+//! Text-to-image rendering ("pixel-mode"), squishi's port of pxpipe's technique (github.com/teamchong/pxpipe, MIT): render dense text as a bitmap PNG instead of shipping it as tokens.
 //!
-//! **Rendering primitive only — delivery is explicitly out of scope here.**
-//! Claude Code has an open, unfixed platform bug
-//! (anthropics/claude-code#31208) where an MCP tool's image response is
-//! turned into base64 TEXT instead of a native image block — "10-20x token
-//! waste," the opposite of the point. The only real delivery mechanism
-//! (a wire-level proxy) doesn't exist yet in this codebase. This module
-//! renders and reports a profitability decision; nothing here is wired to
-//! any live consumer.
+//! Rendering primitive only -- delivery is out of scope. Claude Code has an open platform bug (anthropics/claude-code#31208) turning an MCP tool's image response into base64 text instead of a native image block, the opposite of the point; no live consumer is wired to this module yet.
 //!
-//! **Module boundary**: this file never imports or shells out to `trm`.
-//! Pixel-mode is lossy (an image isn't OCR-guaranteed byte-exact), so a
-//! real deployment needs CCR registration of the original text — but that's
-//! the *caller's* job (governator, when this is eventually wired in), the
-//! same split `dispatch.rs::finalize_with_recovery` already proves for text
-//! compression. `render_to_png` takes text and returns PNG bytes; the
-//! caller already has the original text it passed in, so it's free to
-//! register it with CCR before or after calling this.
+//! This file never imports or shells out to `trm`. Pixel-mode is lossy, so a real deployment needs CCR registration of the original text, but that's the caller's job, not this module's.
 //!
-//! **Eligibility is a safety gate, not just a density heuristic.** pxpipe
-//! states its own limitation: unsafe for byte-exact recall of short strings
-//! — hashes, secrets, identifiers, code. squishi already classifies content
-//! via [`crate::content_detect`]; the eligible set here is exactly
-//! `Json`/`Log`/`PlainText` — `Diff` and anything Magika calls `Other(_)`
-//! (its bucket for recognized non-prose formats: rust, html, csv,
-//! markdown, ...) are refused outright, regardless of density.
+//! Eligibility is a safety gate, not just a density heuristic: pxpipe states its own limitation of being unsafe for byte-exact recall of short strings (hashes, secrets, identifiers, code). The eligible set is exactly `Json`/`Log`/`PlainText` -- `Diff` and anything Magika calls `Other(_)` are refused outright, regardless of density.
 
 use crate::content_detect::{self, ContentKind};
 use image::{GrayImage, ImageFormat, Luma};
 use spleen_font::{FONT_5X8, PSF2Font};
 use std::io::Cursor;
 
-/// Spleen's 5×8 glyph cell, the face pxpipe uses for Claude specifically
-/// (pxpipe uses a different font/layout per model family).
+/// Spleen's 5×8 glyph cell, the face pxpipe uses for Claude specifically.
 pub const GLYPH_WIDTH: u32 = 5;
 pub const GLYPH_HEIGHT: u32 = 8;
 
-/// pxpipe's real page geometry for Claude: 312 columns, 1568×728px pages.
+/// pxpipe's page geometry for Claude: 312 columns, 1568×728px pages.
 pub const COLUMNS: u32 = 312;
 pub const PAGE_WIDTH: u32 = 1568;
 pub const PAGE_HEIGHT: u32 = 728;
 
-/// `728 / 8 == 91` exactly — the page height is an exact multiple of the
-/// glyph height, so stacked pages need no vertical padding between them.
+/// `728 / 8 == 91` exactly, so stacked pages need no vertical padding between them.
 pub const ROWS_PER_PAGE: u32 = PAGE_HEIGHT / GLYPH_HEIGHT;
 
-/// `312 * 5 == 1560`, 8px short of the real 1568px page width. Not a typo:
-/// pxpipe's own stated page width leaves a margin around the glyph grid
-/// rather than the grid filling the page edge-to-edge. Split evenly, 4px a
-/// side — a reading judgment call, not a value pxpipe documents directly.
+/// `312 * 5 == 1560`, 8px short of the real 1568px page width -- not a typo, pxpipe's page leaves a margin around the glyph grid rather than filling edge-to-edge. Split evenly, 4px a side.
 const H_MARGIN: u32 = (PAGE_WIDTH - COLUMNS * GLYPH_WIDTH) / 2;
 
-// Page geometry is fixed at compile time, so its own internal consistency
-// is a compile-time fact, not something worth a runtime test for: pages
-// must stack with no seam, and the glyph grid must fit inside the page.
+// Page geometry is fixed at compile time, so its internal consistency is a compile-time fact, not a runtime test.
 const _: () = assert!(ROWS_PER_PAGE * GLYPH_HEIGHT == PAGE_HEIGHT);
 const _: () = assert!(COLUMNS * GLYPH_WIDTH <= PAGE_WIDTH);
 
-/// Heuristic chars-per-token threshold below which content is considered
-/// "dense" and worth rendering as pixels. pxpipe's own gate (calibrated on
-/// its N=391 production rows) targets ~1 char/token dense content and
-/// declines ~3.5 char/token sparse prose — those are pxpipe's numbers, not
-/// squishi's, because squishi has no access to Claude's real tokenizer
-/// (Anthropic doesn't publish one). This threshold is calibrated instead
-/// against `estimate_chars_per_token`'s own proxy measurement on real
-/// squishi fixtures — same "start from the reference, recalibrate against
-/// real fixtures" discipline as every `--level` threshold in this
-/// codebase. Real measured numbers (see this module's tests): dense JSON
-/// 1.951 chars/token, real source code 3.375, sparse README prose 5.203 —
-/// `2.5` sits with healthy margin on both sides, not a coin-flip line.
+/// Chars-per-token threshold below which content is "dense" enough to render as pixels. squishi has no access to Claude's real tokenizer (Anthropic doesn't publish one), so this is calibrated against `estimate_chars_per_token`'s own proxy measurement on real fixtures rather than pxpipe's own ~1/~3.5 numbers (measured against a real tokenizer this module doesn't have). Measured: dense JSON 1.951 chars/token, source code 3.375, README prose 5.203 -- `2.5` sits with healthy margin on both sides.
 const PROFITABLE_CHARS_PER_TOKEN: f64 = 2.5;
 
-/// Proxy for "characters per token" without a real Claude tokenizer
-/// (Anthropic doesn't publish one, and squishi's existing `tokenizers`
-/// dependency loads embedding-model tokenizers for semantic dedup, not a
-/// general-purpose BPE tokenizer representative of Claude's own — reusing
-/// it here would misrepresent precision this doesn't have).
-///
-/// Approximation: real BPE tokenizers tend to split punctuation/symbols
-/// into their own token, while whitespace is usually absorbed into an
-/// adjacent word token rather than costing one of its own. So: every
-/// maximal run of alphanumeric characters counts as one token-sized chunk,
-/// every other non-whitespace character (`{`, `"`, `:`, `,`, ...) counts as
-/// its own chunk, and whitespace contributes chars but no chunk of its
-/// own. `chars_per_token = total_chars / chunk_count`. Punctuation-dense
-/// content (minified JSON, log lines heavy on brackets/colons) drives this
-/// number down; long alphabetic runs (prose) drive it up — the same
-/// direction pxpipe's real gate cares about, even though the absolute
-/// numbers are this module's own, not pxpipe's.
+/// Proxy for "characters per token" without a real Claude tokenizer. Every maximal run of alphanumeric characters counts as one chunk, every other non-whitespace character counts as its own chunk, whitespace contributes chars but no chunk -- `chars_per_token = total_chars / chunk_count`. Punctuation-dense content drives this down, long alphabetic runs (prose) drive it up, the same direction pxpipe's real gate cares about.
 fn estimate_chars_per_token(text: &str) -> f64 {
     let total_chars = text.chars().count();
     if total_chars == 0 {
@@ -115,9 +59,7 @@ fn estimate_chars_per_token(text: &str) -> f64 {
     total_chars as f64 / chunks.max(1) as f64
 }
 
-/// pxpipe's density gate, ported as a heuristic proxy (see
-/// [`estimate_chars_per_token`]). Declines empty input — nothing to gain
-/// by rendering zero characters as pixels.
+/// pxpipe's density gate, ported as a heuristic proxy (see [`estimate_chars_per_token`]). Declines empty input.
 pub fn is_profitable(text: &str) -> bool {
     if text.is_empty() {
         return false;
@@ -125,10 +67,7 @@ pub fn is_profitable(text: &str) -> bool {
     estimate_chars_per_token(text) <= PROFITABLE_CHARS_PER_TOKEN
 }
 
-/// The safety gate pxpipe states about itself: never eligible for content
-/// unsafe to lose byte-exact recall on. `SearchResults` is excluded too —
-/// file:line references are exactly the kind of short identifier this
-/// technique isn't safe for, even though it isn't literally "code."
+/// The safety gate pxpipe states about itself: never eligible for content unsafe to lose byte-exact recall on. `SearchResults` is excluded too -- file:line references are the kind of short identifier this isn't safe for.
 pub fn eligible_kind(kind: &ContentKind) -> bool {
     matches!(
         kind,
@@ -136,19 +75,9 @@ pub fn eligible_kind(kind: &ContentKind) -> bool {
     )
 }
 
-/// Render `text` onto Spleen-5×8, 312-column, 1568×728px pages and encode
-/// as a single PNG. Content that needs more than one page's row capacity
-/// (`ROWS_PER_PAGE` per page) spills onto additional pages, stacked
-/// vertically into one taller image — `render_to_png` returns one `Vec<u8>`
-/// per pxpipe's own per-request framing, so multi-page output has to live
-/// in that one buffer; pxpipe itself ships pages as separate image
-/// attachments, but nothing here streams multiple artifacts back to a
-/// caller yet (no consumer exists — see the module doc comment), so a
-/// single stacked PNG is the simplest faithful choice today. Revisit if a
-/// real caller ever needs discrete per-page images.
+/// Render `text` onto Spleen-5×8, 312-column, 1568×728px pages and encode as a single PNG. Content needing more than one page's row capacity spills onto additional pages, stacked vertically into one taller image (`render_to_png` returns one `Vec<u8>`, unlike pxpipe's separate per-page attachments -- no consumer needs discrete pages yet).
 ///
-/// A `\n` in `text` always starts a new row (preserves log/JSON line
-/// structure); a line longer than `COLUMNS` wraps onto additional rows.
+/// A `\n` always starts a new row; a line longer than `COLUMNS` wraps onto additional rows.
 pub fn render_to_png(text: &str) -> Vec<u8> {
     let rows = wrap_into_rows(text);
     let page_count = rows.len().div_ceil(ROWS_PER_PAGE as usize).max(1);
@@ -168,9 +97,7 @@ pub fn render_to_png(text: &str) -> Vec<u8> {
     encode_png(&image)
 }
 
-/// Split `text` into display rows: `\n` forces a row break, and any line
-/// longer than `COLUMNS` characters wraps onto as many additional rows as
-/// it needs.
+/// Split `text` into display rows: `\n` forces a row break, and any line longer than `COLUMNS` wraps onto as many additional rows as it needs.
 fn wrap_into_rows(text: &str) -> Vec<String> {
     let mut rows = Vec::new();
     for line in text.split('\n') {
@@ -186,10 +113,7 @@ fn wrap_into_rows(text: &str) -> Vec<String> {
     rows
 }
 
-/// Blit one glyph's pixels at `(x0, y0)`. Characters the bundled font has
-/// no glyph for (rare — control characters mainly) are left blank rather
-/// than erroring; a blank cell is a safe, visible "nothing renderable here"
-/// signal on the page.
+/// Blit one glyph's pixels at `(x0, y0)`. Characters the bundled font has no glyph for are left blank rather than erroring.
 fn blit_glyph(image: &mut GrayImage, font: &mut PSF2Font, ch: char, x0: u32, y0: u32) {
     let mut buf = [0u8; 4];
     let bytes = ch.encode_utf8(&mut buf).as_bytes();
@@ -213,10 +137,7 @@ fn encode_png(image: &GrayImage) -> Vec<u8> {
     bytes
 }
 
-/// Convenience wrapper composing detection + both gates + render, mirroring
-/// `toon::encode_if_smaller`'s "returns `None` on decline" shape. Detection
-/// runs once here rather than asking every caller to run it and pass a
-/// `ContentKind` in separately.
+/// Composes detection + both gates + render, mirroring `toon::encode_if_smaller`'s "returns `None` on decline" shape.
 pub fn render_if_profitable(text: &str) -> Option<Vec<u8>> {
     let kind = content_detect::detect(text);
     if !eligible_kind(&kind) {
@@ -233,10 +154,8 @@ mod tests {
     use super::*;
 
     // --- Real fixtures -----------------------------------------------
-    //
-    // Dense: a real excerpt of graphify's own graph.json, minified to one
-    // line per record (real data, already used as a fixture for item #3
-    // and TOON — reused here rather than fabricated).
+
+    // Dense: a real excerpt of graphify's own graph.json, minified to one line per record.
     const DENSE_JSON_FIXTURE: &str = r#"{"id":"src/toon.rs::encode","kind":"function","file":"src/toon.rs","line":42,"community":3,"degree":17,"betweenness":0.083,"tags":["json","codec","public-api"]}"#;
 
     // Sparse: a real excerpt of this crate's own README.md prose.
@@ -260,10 +179,7 @@ mod tests {
     #[test]
     fn dense_json_measures_well_under_the_profitability_threshold() {
         let density = estimate_chars_per_token(DENSE_JSON_FIXTURE);
-        // Real measured number, recorded so a future change to the
-        // heuristic has something concrete to diff against — not assumed
-        // to equal pxpipe's own ~1 char/token, which was measured against
-        // a real Claude tokenizer this module doesn't have.
+        // Real measured number, recorded so a future heuristic change has something concrete to diff against.
         assert!(
             density < PROFITABLE_CHARS_PER_TOKEN,
             "dense JSON measured {density} chars/token, expected well under {PROFITABLE_CHARS_PER_TOKEN}"
@@ -290,10 +206,7 @@ mod tests {
 
     #[test]
     fn code_classified_content_is_refused_regardless_of_density() {
-        // Prove the eligibility gate is what's under test, not an
-        // incidental side effect of low density: real squishi source is
-        // dense code (lots of punctuation), so if only the density gate
-        // ran, it would pass. It must still be refused.
+        // Proves the eligibility gate is what's under test, not density: real source is dense code, so density alone would pass it.
         let kind = content_detect::detect(CODE_FIXTURE);
         assert!(
             !eligible_kind(&kind),
@@ -312,9 +225,7 @@ mod tests {
 
     #[test]
     fn sparse_prose_is_eligible_but_declined_on_density() {
-        // PlainText is in the eligible set — it's density, not kind, that
-        // declines it, and render_if_profitable must decline for the
-        // right reason either way.
+        // PlainText is eligible -- it's density, not kind, that declines it here.
         let kind = content_detect::detect(SPARSE_PROSE_FIXTURE);
         assert_eq!(kind, ContentKind::PlainText);
         assert!(eligible_kind(&kind));
@@ -340,9 +251,7 @@ mod tests {
 
     #[test]
     fn content_longer_than_one_page_spills_onto_a_second_page() {
-        // One row longer than COLUMNS forces wrapping onto a second row;
-        // ROWS_PER_PAGE such rows forces a second page. Build text that's
-        // guaranteed to exceed one page's row capacity.
+        // Text guaranteed to exceed one page's row capacity.
         let text = "x".repeat(COLUMNS as usize * (ROWS_PER_PAGE as usize + 1));
         let png = render_to_png(&text);
         let decoded = image::load_from_memory(&png).unwrap();
@@ -356,7 +265,7 @@ mod tests {
         let decoded = image::load_from_memory(&png).unwrap();
         assert_eq!(decoded.width(), PAGE_WIDTH);
         assert_eq!(decoded.height(), PAGE_HEIGHT);
-        // Fully blank (white) — no glyphs were blitted.
+        // Fully blank (white) -- no glyphs were blitted.
         assert!(decoded.to_luma8().pixels().all(|p| p.0[0] == 255));
     }
 

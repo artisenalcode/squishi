@@ -1,11 +1,4 @@
-//! Log/build-output compression: classify each line's importance, keep
-//! the important ones plus context, drop the rest with a summary marker.
-//!
-//! Own design, not a port — arrived at after reading headroom's
-//! LogCompressor mechanism (classify → score → select → format) to
-//! understand *why* it gets real compression on repetitive logs, then
-//! implementing squishi's own version of the same shape in plain Rust,
-//! no external process.
+//! Log/build-output compression: classify each line's importance, keep the important ones plus context, drop the rest with a summary marker.
 
 use regex::Regex;
 use std::sync::LazyLock;
@@ -107,9 +100,7 @@ pub fn compress_log(content: &str, config: &LogCompressConfig) -> LogCompressRes
     selected.extend(select_first_last_and_top(&warnings, config.max_warnings));
     selected.extend(summaries.iter().map(|l| l.index));
 
-    // Nothing flagged as error/warn/summary — there's no signal to justify
-    // dropping any line, so don't. Only content with actual important/
-    // unimportant contrast gets compressed.
+    // Nothing flagged as error/warn/summary -- no signal to justify dropping any line.
     if selected.is_empty() {
         return LogCompressResult {
             original_line_count: lines.len(),
@@ -128,9 +119,7 @@ pub fn compress_log(content: &str, config: &LogCompressConfig) -> LogCompressRes
     with_context.sort_unstable();
     with_context.dedup();
 
-    // Fixed budget cap (not headroom's adaptive sizer — deliberately
-    // simpler for v1): if still over budget, keep the highest-scoring
-    // lines within the context-expanded set.
+    // Fixed budget cap: if still over budget, keep the highest-scoring lines within the context-expanded set.
     let final_indices: Vec<usize> = if with_context.len() > config.max_total_lines {
         let mut scored: Vec<(usize, u8)> = with_context
             .iter()

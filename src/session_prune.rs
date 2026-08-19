@@ -1,34 +1,10 @@
-//! Structural pruning for Claude Code session transcripts — a different
-//! problem from squishi's existing shape-based compressors
-//! (`content_detect` + friends), which operate on a single blob's *text
-//! shape*. This operates on a transcript's *structure* (which tool ran,
-//! on what path, superseded by what) — real measurement earlier this
-//! session found squishi's shape compressors barely touch real session
-//! transcripts (the one path that loads the expensive semantic model,
-//! `PlainText`, had zero qualifying blocks in a real 4713-line coding
-//! session — everything reads as code/diff/log-shaped).
+//! Structural pruning for Claude Code session transcripts -- unlike squishi's shape-based compressors (`content_detect` + friends), which operate on a single blob's text shape, this operates on a transcript's structure: which tool ran, on what path, superseded by what.
 //!
-//! Five rules, previously speced in README.md's "Remembered" section,
-//! pressure-tested by the user's technical advisory board (2026-08-07,
-//! see docs/ideation/agent-stack-architecture/) before being built here.
-//! Rule 2 ("supersede write by read") ships but is **off by default** at
-//! the CLI layer — board consensus (Fowler): real false-positive risk,
-//! ship behind a flag until real usage data exists.
+//! Five rules. Rule 2 ("supersede write by read") ships but is off by default at the CLI layer -- real false-positive risk, behind a flag until usage data exists.
 //!
-//! Real transcript shape, confirmed by reading a live Claude Code
-//! transcript directly, not assumed: one JSON record per line;
-//! `message.content` is a list of blocks when the message carries tool
-//! activity — `{"type":"tool_use","id","name","input"}` (input.file_path
-//! present for Read/Write/Edit) and, in a later message,
-//! `{"type":"tool_result","tool_use_id","content","is_error"}`.
-//! Transcript JSONL isn't a versioned contract — parsing is defensive
-//! throughout: an unparseable or unrecognized line is skipped, never a
-//! hard error.
+//! Transcript shape: one JSON record per line; `message.content` is a list of blocks, `{"type":"tool_use","id","name","input"}` (input.file_path for Read/Write/Edit) and later `{"type":"tool_result","tool_use_id","content","is_error"}`. Transcript JSONL isn't a versioned contract -- parsing is defensive throughout, an unparseable or unrecognized line is skipped, never a hard error.
 //!
-//! No live transcript mutation happens here or anywhere in this crate —
-//! confirmed via the real Claude Code hooks reference that no hook can
-//! rewrite a past transcript entry. `apply_pruning` only ever produces a
-//! new copy; callers are responsible for never overwriting the original.
+//! No live transcript mutation happens here or anywhere in this crate. `apply_pruning` only ever produces a new copy; callers are responsible for never overwriting the original.
 
 use serde_json::Value;
 use std::collections::HashMap;
@@ -65,11 +41,7 @@ pub struct PruneCandidate {
     pub bytes: usize,
 }
 
-/// Parse a transcript into a flat, ordered list of tool activity.
-/// Anything that isn't a recognizable tool_use/tool_result block —
-/// plain text messages, unknown record shapes, malformed JSON lines —
-/// is silently skipped, not an error. Transcript shape isn't a
-/// versioned contract this crate controls.
+/// Parse a transcript into a flat, ordered list of tool activity. Anything not a recognizable tool_use/tool_result block is silently skipped, not an error.
 pub fn parse(jsonl: &str) -> Vec<SessionItem> {
     let mut items = Vec::new();
     for (line_index, line) in jsonl.lines().enumerate() {
@@ -192,9 +164,7 @@ pub fn dedupe_latest_read(items: &[SessionItem]) -> Vec<PruneCandidate> {
     candidates
 }
 
-/// Rule 2 (off by default at the CLI layer — see module doc): a
-/// `Write`/`Edit`'s own tool result is prunable once a later `Read` of
-/// the same path exists.
+/// Rule 2 (off by default at the CLI layer, see module doc): a `Write`/`Edit`'s own tool result is prunable once a later `Read` of the same path exists.
 pub fn supersede_write_by_read(items: &[SessionItem]) -> Vec<PruneCandidate> {
     let results = tool_result_index(items);
     let mut writes: Vec<&ToolUseItem> = Vec::new();
@@ -327,9 +297,7 @@ pub fn collapse_task_launches(items: &[SessionItem]) -> Vec<PruneCandidate> {
         .collect()
 }
 
-/// Run every rule that's on. `include_rule_2` gates
-/// `supersede_write_by_read` — off by default at the CLI layer per board
-/// consensus, always available as a pure function above regardless.
+/// Run every rule that's on. `include_rule_2` gates `supersede_write_by_read`, off by default at the CLI layer, always available as a pure function above regardless.
 pub fn run(
     items: &[SessionItem],
     include_rule_2: bool,
@@ -346,11 +314,7 @@ pub fn run(
     candidates
 }
 
-/// Produce a pruned *copy* of `jsonl` — never mutates, never touches the
-/// input. Only lines containing a pruned tool_result are rewritten (the
-/// flagged block's `content` replaced with a short marker); every other
-/// line is passed through byte-for-byte, so a diff against the original
-/// only ever shows the intentional changes.
+/// Produce a pruned *copy* of `jsonl` -- never mutates the input. Only lines containing a pruned tool_result are rewritten; every other line passes through byte-for-byte.
 pub fn apply_pruning(jsonl: &str, candidates: &[PruneCandidate]) -> String {
     let prune_ids: HashMap<&str, &PruneCandidate> = candidates
         .iter()
@@ -412,9 +376,7 @@ pub fn apply_pruning(jsonl: &str, candidates: &[PruneCandidate]) -> String {
 mod tests {
     use super::*;
 
-    /// Real-shape fixture lines — field names, block structure and value
-    /// shapes match a live Claude Code transcript, confirmed by direct
-    /// inspection (see module doc), not invented.
+    /// Real-shape fixture lines matching a live Claude Code transcript.
     fn tool_use_line(id: &str, name: &str, path: Option<&str>) -> String {
         let input = match path {
             Some(p) => format!(r#"{{"file_path":"{p}"}}"#),
