@@ -5,7 +5,7 @@ use squishi::content_detect::{ContentKind, detect};
 use squishi::diff_compress::{DiffCompressConfig, compress_diff};
 use squishi::doctor;
 use squishi::invariants::InvariantConfig;
-use squishi::json_compress::{JsonCompressConfig, compress_json_array};
+use squishi::json_compress::{JsonCompressConfig, JsonRendering, compress_json_array};
 use squishi::line_dedup::dedupe_line_runs;
 use squishi::line_number_strip::strip_read_tool_line_numbers;
 use squishi::log_compress::{LogCompressConfig, compress_log};
@@ -214,6 +214,7 @@ fn configs_for_level(level: Level) -> LevelConfigs {
             json: JsonCompressConfig {
                 keep_edge: 10,
                 invariants: InvariantConfig::default(),
+                ..JsonCompressConfig::default()
             },
         },
         Level::Default => LevelConfigs {
@@ -238,6 +239,7 @@ fn configs_for_level(level: Level) -> LevelConfigs {
             json: JsonCompressConfig {
                 keep_edge: 2,
                 invariants: InvariantConfig::default(),
+                ..JsonCompressConfig::default()
             },
         },
     }
@@ -367,8 +369,11 @@ fn route_impl(
     let output = match &kind {
         ContentKind::Json => match compress_json_array(text, &configs.json) {
             Some(result) => Output {
+                source: match result.rendering {
+                    JsonRendering::RowSelected => "json",
+                    JsonRendering::CsvSchema => "json-csv-schema",
+                },
                 compressed: result.content,
-                source: "json",
                 detail: Map::from_iter([
                     (
                         "elements_before".to_string(),

@@ -1,13 +1,16 @@
 pub mod base64_strip;
+pub mod compaction;
 pub mod content_detect;
 pub mod diff_compress;
 pub mod doctor;
+pub mod error_keywords;
 pub mod invariants;
 pub mod json_compress;
 pub mod line_dedup;
 pub mod line_number_strip;
 pub mod log_compress;
 mod magika_labels;
+pub mod outliers;
 pub mod pixel;
 pub mod punctuation_restore;
 pub mod search_compress;

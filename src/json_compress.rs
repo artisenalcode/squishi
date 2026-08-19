@@ -1,6 +1,13 @@
 //! JSON array compression: dedupe exact-duplicate elements, then cap to
-//! first + last N with a dropped-count marker. Scoped to arrays — a
-//! single object has nothing repeatable to compress.
+//! first + last N plus any "interesting" rows a drop would otherwise
+//! bury -- error-keyword hits and structural/status outliers (see
+//! `crate::outliers`) survive regardless of position. Scoped to arrays
+//! — a single object has nothing repeatable to compress.
+//!
+//! Interest survivors keep the array's original relative order, so the
+//! dropped set can end up as several separate runs instead of one
+//! contiguous middle slice -- each run gets its own marker, computed
+//! only from that run's own dropped elements.
 //!
 //! The dropped-count marker is enriched with verified facts about the
 //! dropped elements when they're objects (see `crate::invariants`) —
@@ -17,10 +24,12 @@
 //! weaken the exact-duplicate dedup below. `raw_value` has zero such
 //! effect, confirmed the same way.
 
+use crate::compaction;
 use crate::invariants::{self, InvariantConfig, Unit};
+use crate::outliers;
 use serde_json::Value;
 use serde_json::value::RawValue;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Tunable knobs for `compress_json_array` — `--level` varies `keep_edge`.
 pub struct JsonCompressConfig {
@@ -28,6 +37,11 @@ pub struct JsonCompressConfig {
     pub keep_edge: usize,
     /// Thresholds for the invariant-disclosure marker text.
     pub invariants: InvariantConfig,
+    /// Minimum byte-savings ratio (0.0..1.0) the CSV-schema rendering
+    /// must beat the deduped array's minified JSON by to be used in
+    /// place of the lossy row-selection path. Matches headroom's own
+    /// `lossless_min_savings_ratio` default.
+    pub lossless_min_savings_ratio: f64,
 }
 
 impl Default for JsonCompressConfig {
@@ -35,14 +49,28 @@ impl Default for JsonCompressConfig {
         Self {
             keep_edge: 5,
             invariants: InvariantConfig::default(),
+            lossless_min_savings_ratio: 0.30,
         }
     }
+}
+
+/// Which path produced `JsonCompressResult::content`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonRendering {
+    /// The usual dedup + edge/interest row selection. `content` is a
+    /// JSON array (possibly with string markers standing in for
+    /// dropped runs).
+    RowSelected,
+    /// A cleanly tabular array rendered losslessly as `[N]{cols}` CSV
+    /// -- no rows dropped, `content` is CSV text, not JSON.
+    CsvSchema,
 }
 
 pub struct JsonCompressResult {
     pub original_elements: usize,
     pub compressed_elements: usize,
     pub content: String,
+    pub rendering: JsonRendering,
 }
 
 /// Returns `None` if `content` isn't a JSON array — caller should fall
@@ -72,15 +100,34 @@ pub fn compress_json_array(
         }
     }
 
+    // `render_csv_schema` itself declines arrays under 2 items.
+    if let Some(csv) = compaction::render_csv_schema(&seen) {
+        let minified_len = serde_json::to_string(&seen).map(|s| s.len()).unwrap_or(0);
+        let savings = if minified_len == 0 {
+            0.0
+        } else {
+            1.0 - (csv.len() as f64 / minified_len as f64)
+        };
+        if savings >= config.lossless_min_savings_ratio {
+            return Some(JsonCompressResult {
+                original_elements,
+                compressed_elements: seen.len(),
+                content: csv,
+                rendering: JsonRendering::CsvSchema,
+            });
+        }
+    }
+
     let keep_edge = config.keep_edge;
     let final_elements: Vec<Value> = if seen.len() > keep_edge * 2 {
-        let dropped_indices = &seen_original_index[keep_edge..seen.len() - keep_edge];
-        let marker = build_marker(content, dropped_indices, &config.invariants);
-
-        let mut kept: Vec<Value> = seen[..keep_edge].to_vec();
-        kept.push(Value::String(marker));
-        kept.extend_from_slice(&seen[seen.len() - keep_edge..]);
-        kept
+        let kept_positions = select_kept_positions(&seen, keep_edge);
+        build_output_with_markers(
+            content,
+            &seen,
+            &seen_original_index,
+            &kept_positions,
+            &config.invariants,
+        )
     } else {
         seen
     };
@@ -92,7 +139,82 @@ pub fn compress_json_array(
         original_elements,
         compressed_elements,
         content,
+        rendering: JsonRendering::RowSelected,
     })
+}
+
+/// Positions into `seen` to keep verbatim: the first/last `keep_edge`
+/// (edge budget) plus up to `keep_edge * 2` "interesting" survivors
+/// (interest budget) -- error-keyword hits first, then structural/
+/// status outliers, each tier truncated by ascending index once the
+/// interest budget is spent. Interest positions already inside the
+/// edge budget don't cost anything extra.
+fn select_kept_positions(seen: &[Value], keep_edge: usize) -> BTreeSet<usize> {
+    let is_edge = |pos: usize| pos < keep_edge || pos >= seen.len() - keep_edge;
+    let interest_budget = keep_edge * 2;
+
+    let mut kept: BTreeSet<usize> = (0..keep_edge)
+        .chain(seen.len() - keep_edge..seen.len())
+        .collect();
+
+    let mut interest_spent = 0usize;
+    let error_positions = outliers::detect_error_items_for_preservation(seen, None);
+    let structural_positions = outliers::detect_structural_outliers(seen);
+    for pos in error_positions.into_iter().chain(structural_positions) {
+        if is_edge(pos) || kept.contains(&pos) {
+            continue;
+        }
+        if interest_spent >= interest_budget {
+            break;
+        }
+        kept.insert(pos);
+        interest_spent += 1;
+    }
+
+    kept
+}
+
+/// Walks `seen` in order, keeping every position in `kept_positions`
+/// verbatim and collapsing each run of consecutive dropped positions
+/// into its own marker -- so interest survivors that split the dropped
+/// set into several pieces each get an accurate, independently-computed
+/// disclosure instead of one marker describing an assumed-contiguous
+/// middle slice.
+fn build_output_with_markers(
+    content: &str,
+    seen: &[Value],
+    seen_original_index: &[usize],
+    kept_positions: &BTreeSet<usize>,
+    invariant_config: &InvariantConfig,
+) -> Vec<Value> {
+    let mut final_elements: Vec<Value> = Vec::new();
+    let mut pending_run: Vec<usize> = Vec::new();
+
+    let flush = |run: &mut Vec<usize>, out: &mut Vec<Value>| {
+        if run.is_empty() {
+            return;
+        }
+        let dropped_original: Vec<usize> =
+            run.iter().map(|&pos| seen_original_index[pos]).collect();
+        out.push(Value::String(build_marker(
+            content,
+            &dropped_original,
+            invariant_config,
+        )));
+        run.clear();
+    };
+
+    for (pos, element) in seen.iter().enumerate() {
+        if kept_positions.contains(&pos) {
+            flush(&mut pending_run, &mut final_elements);
+            final_elements.push(element.clone());
+        } else {
+            pending_run.push(pos);
+        }
+    }
+    flush(&mut pending_run, &mut final_elements);
+
+    final_elements
 }
 
 /// Builds the dropped-elements marker: the bare count-only form, enriched
@@ -166,6 +288,28 @@ mod tests {
     }
 
     #[test]
+    fn cleanly_tabular_array_renders_as_csv_schema_not_row_selection() {
+        // Every element is a small, uniform, all-scalar object -- the
+        // exact shape step 4/5's lossless path exists for. No
+        // session_token/nested field here to disqualify it.
+        let elements: Vec<String> = (0..50)
+            .map(|i| format!(r#"{{"id":{i},"status":"ok"}}"#))
+            .collect();
+        let content = format!("[{}]", elements.join(","));
+        let result = compress_json_array(&content, &JsonCompressConfig::default()).unwrap();
+
+        assert_eq!(result.rendering, JsonRendering::CsvSchema);
+        assert_eq!(result.original_elements, 50);
+        // Lossless: every deduped row survives, nothing dropped.
+        assert_eq!(result.compressed_elements, 50);
+        assert!(result.content.starts_with("[50]{"));
+        assert!(result.content.contains("0,ok"));
+        assert!(result.content.contains("49,ok"));
+        // Not a JSON array -- CSV text.
+        assert!(serde_json::from_str::<Value>(&result.content).is_err());
+    }
+
+    #[test]
     fn small_array_is_unchanged_besides_formatting() {
         let content = r#"[1,2,3]"#;
         let result = compress_json_array(content, &JsonCompressConfig::default()).unwrap();
@@ -175,7 +319,15 @@ mod tests {
 
     #[test]
     fn large_array_caps_to_first_and_last_edge() {
-        let elements: Vec<String> = (0..50).map(|i| format!(r#"{{"id":{i}}}"#)).collect();
+        // `session_token` is a credential-named array cell: it disqualifies
+        // the CSV-schema path (an array cell isn't scalar) and is
+        // unconditionally withheld by invariants::describe's credential-name
+        // check, so it can't add a stray fact either. That keeps this test on
+        // the row-selection path it's actually about -- CSV-schema has its
+        // own tests in `compaction.rs`.
+        let elements: Vec<String> = (0..50)
+            .map(|i| format!(r#"{{"id":{i},"session_token":[{i}]}}"#))
+            .collect();
         let content = format!("[{}]", elements.join(","));
         let config = JsonCompressConfig::default();
         let result = compress_json_array(&content, &config).unwrap();
@@ -188,11 +340,16 @@ mod tests {
 
     #[test]
     fn keep_edge_is_configurable() {
-        let elements: Vec<String> = (0..10).map(|i| format!(r#"{{"id":{i}}}"#)).collect();
+        // `session_token` disqualifies CSV-schema and is credential-named so it
+        // can't add a stray invariants fact -- see the comment on
+        // `large_array_caps_to_first_and_last_edge`.
+        let elements: Vec<String> = (0..10)
+            .map(|i| format!(r#"{{"id":{i},"session_token":[{i}]}}"#))
+            .collect();
         let content = format!("[{}]", elements.join(","));
         let config = JsonCompressConfig {
             keep_edge: 2,
-            invariants: InvariantConfig::default(),
+            ..JsonCompressConfig::default()
         };
         let result = compress_json_array(&content, &config).unwrap();
         assert_eq!(result.compressed_elements, 2 * 2 + 1);
@@ -207,12 +364,17 @@ mod tests {
     /// numeric range should all show up in one marker.
     #[test]
     fn dropped_elements_marker_states_constant_enum_and_range_facts() {
+        // `session_token` disqualifies CSV-schema and is credential-named so it
+        // can't add a stray invariants fact -- see the comment on
+        // `large_array_caps_to_first_and_last_edge`.
         let statuses = ["active", "pending", "closed"];
         let elements: Vec<String> = (0..20)
             .map(|i| {
                 let status = statuses[i % statuses.len()];
                 let amount = 5.00 + i as f64;
-                format!(r#"{{"id":{i},"kind":"widget","status":"{status}","amount":{amount:.2}}}"#)
+                format!(
+                    r#"{{"id":{i},"kind":"widget","status":"{status}","amount":{amount:.2},"session_token":[{i}]}}"#
+                )
             })
             .collect();
         let content = format!("[{}]", elements.join(","));
@@ -243,8 +405,11 @@ mod tests {
     /// caveman's own `order_id` example targets.
     #[test]
     fn dropped_elements_with_a_unique_id_each_render_coverage_not_enumeration() {
+        // `session_token` disqualifies CSV-schema and is credential-named so it
+        // can't add a stray invariants fact -- see the comment on
+        // `large_array_caps_to_first_and_last_edge`.
         let elements: Vec<String> = (0..20)
-            .map(|i| format!(r#"{{"order_id":"ord-{i:04}"}}"#))
+            .map(|i| format!(r#"{{"order_id":"ord-{i:04}","session_token":[{i}]}}"#))
             .collect();
         let content = format!("[{}]", elements.join(","));
         let result = compress_json_array(&content, &JsonCompressConfig::default()).unwrap();
@@ -279,8 +444,16 @@ mod tests {
             "zeta state",
             "eta state",
         ];
+        // `session_token` disqualifies CSV-schema and is credential-named so it
+        // can't add a stray invariants fact -- see the comment on
+        // `large_array_caps_to_first_and_last_edge`.
         let elements: Vec<String> = (0..20)
-            .map(|i| format!(r#"{{"id":{i},"note":"{}"}}"#, notes[i % notes.len()]))
+            .map(|i| {
+                format!(
+                    r#"{{"id":{i},"note":"{}","session_token":[{i}]}}"#,
+                    notes[i % notes.len()]
+                )
+            })
             .collect();
         let content = format!("[{}]", elements.join(","));
         let result = compress_json_array(&content, &JsonCompressConfig::default()).unwrap();
@@ -312,6 +485,36 @@ mod tests {
         );
     }
 
+    /// An error item buried in the middle of a large array survives the
+    /// edge cap, and splits the drop into two separately-computed
+    /// markers instead of one marker over an assumed-contiguous middle
+    /// slice.
+    #[test]
+    fn error_item_buried_in_the_middle_survives_and_splits_the_marker() {
+        // `session_token` disqualifies CSV-schema and is credential-named so it
+        // can't add a stray invariants fact -- see the comment on
+        // `large_array_caps_to_first_and_last_edge`. Without it this
+        // fixture is cleanly tabular and the lossless path would fire
+        // instead of the row-selection path this test targets.
+        let mut elements: Vec<String> = (0..30)
+            .map(|i| format!(r#"{{"id":{i},"status":"ok","session_token":[{i}]}}"#))
+            .collect();
+        elements[15] =
+            r#"{"id":15,"status":"error","msg":"request failed","session_token":[15]}"#.to_string();
+        let content = format!("[{}]", elements.join(","));
+        let result = compress_json_array(&content, &JsonCompressConfig::default()).unwrap();
+
+        assert!(
+            result.content.contains(r#""id":15"#),
+            "buried error item must survive: {}",
+            result.content
+        );
+        // Edge keeps (5 + 5) + the survivor + two markers, one per gap.
+        assert_eq!(result.compressed_elements, 5 + 5 + 1 + 2);
+        assert!(result.content.contains("...10 more elements omitted"));
+        assert!(result.content.contains("...9 more elements omitted"));
+    }
+
     /// When NOTHING in the dropped elements clears the safety bar at
     /// all, the marker falls all the way back to the original bare
     /// count-only form -- never a marker that looks enriched (extra
@@ -322,8 +525,11 @@ mod tests {
     /// the fixture out from under the test.
     #[test]
     fn dropped_elements_with_no_safe_facts_at_all_keep_the_exact_bare_marker() {
+        // `session_token` disqualifies CSV-schema and is credential-named so it
+        // can't add a stray invariants fact -- see the comment on
+        // `large_array_caps_to_first_and_last_edge`.
         let elements: Vec<String> = (0..20)
-            .map(|i| format!(r#"{{"session_id":{i}}}"#))
+            .map(|i| format!(r#"{{"session_id":{i},"session_token":[{i}]}}"#))
             .collect();
         let content = format!("[{}]", elements.join(","));
         let result = compress_json_array(&content, &JsonCompressConfig::default()).unwrap();
