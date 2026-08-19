@@ -2232,7 +2232,7 @@ dependencies = [
 
 [[package]]
 name = "squishi"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "candle-core",
  "candle-nn",
