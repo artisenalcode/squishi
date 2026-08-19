@@ -470,12 +470,17 @@ fn toon_rejects_non_json_input_with_a_clear_error() {
 }
 
 /// The real end-to-end proof: whatever `--toon` actually decided for
-/// genuinely messy real production data (graphify's own graph.json,
-/// confirmed non-uniform -- 3 distinct field shapes across 164 nodes,
-/// one node is even missing `_origin`), the result recovers the exact
-/// original value. Doesn't assume TOON wins here -- it may honestly
-/// decline (`toon-not-smaller`) for data this irregular, and the test
-/// checks whichever path was actually taken, not a guessed one.
+/// genuinely messy real production data (a snapshot of graphify's own
+/// graph.json nodes, confirmed non-uniform across several distinct field
+/// shapes), the result recovers the exact original value. Doesn't assume
+/// TOON wins here -- it may honestly decline (`toon-not-smaller`) for
+/// data this irregular, and the test checks whichever path was actually
+/// taken, not a guessed one.
+///
+/// Piped over stdin rather than passed as a CLI arg: the fixture is
+/// ~180KB, past Linux's ~128KB single-argument execve limit
+/// (MAX_ARG_STRLEN), which real large inputs must go through stdin to
+/// avoid anyway.
 #[test]
 fn toon_round_trips_real_graph_json_through_the_binary() {
     let nodes_json = std::fs::read_to_string(concat!(
@@ -484,7 +489,20 @@ fn toon_round_trips_real_graph_json_through_the_binary() {
     ))
     .unwrap();
 
-    let output = run_toon(&nodes_json, true);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_squishi"))
+        .arg("--toon")
+        .arg("--json")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn squishi binary");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(nodes_json.as_bytes())
+        .expect("failed to write to stdin");
+    let output = child.wait_with_output().expect("failed to wait on child");
     assert!(output.status.success(), "{:?}", output);
     let value: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
