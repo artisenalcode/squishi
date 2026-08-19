@@ -134,7 +134,7 @@ jobs:
         run: |
           cd target/${{ matrix.target }}/release
           7z a "../../../squishi-${{ needs.bump-version.outputs.version }}-${{ matrix.target }}.zip" squishi.exe
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: squishi-${{ matrix.target }}
           path: squishi-${{ needs.bump-version.outputs.version }}-${{ matrix.target }}.${{ matrix.archive_ext }}
@@ -143,11 +143,11 @@ jobs:
     needs: [bump-version, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.bump-version.outputs.tag }}
           files: dist/*
