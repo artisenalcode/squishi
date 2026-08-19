@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      version: ${{ steps.check.outputs.version }}
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: check
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          tag="v${version}"
+          if git rev-parse "$tag" >/dev/null 2>&1; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  tag:
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: |
+          git tag "${{ needs.check-version.outputs.tag }}"
+          git push origin "${{ needs.check-version.outputs.tag }}"
+
+  build:
+    needs: [check-version, tag]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive_ext: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive_ext: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive_ext: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive_ext: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.check-version.outputs.tag }}
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Package (unix)
+        if: matrix.archive_ext == 'tar.gz'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf "../../../squishi-${{ needs.check-version.outputs.version }}-${{ matrix.target }}.tar.gz" squishi
+      - name: Package (windows)
+        if: matrix.archive_ext == 'zip'
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          7z a "../../../squishi-${{ needs.check-version.outputs.version }}-${{ matrix.target }}.zip" squishi.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: squishi-${{ matrix.target }}
+          path: squishi-${{ needs.check-version.outputs.version }}-${{ matrix.target }}.${{ matrix.archive_ext }}
+
+  release:
+    needs: [check-version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-version.outputs.tag }}
+          files: dist/*
