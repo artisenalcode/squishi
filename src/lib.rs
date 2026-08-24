@@ -1,4 +1,5 @@
 pub mod base64_strip;
+pub mod cascade_dedup;
 pub mod compaction;
 pub mod content_detect;
 pub mod diff_compress;

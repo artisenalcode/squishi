@@ -81,6 +81,10 @@ struct Cli {
     #[arg(long)]
     batch: bool,
 
+    /// Deduplication method: `minilm` (default, MiniLM transformer) or `cascade` (three-stage fast pipeline). Only affects plain-text dedup.
+    #[arg(long, value_enum, default_value_t = DedupeMethod::MiniLM)]
+    dedup_method: DedupeMethod,
+
     /// How hard each compressor pushes: `conservative` keeps more context (safer, smaller savings), `aggressive` cuts harder (bigger savings, more loss). Applies to the default path and `--batch`; not read by `--session-prune`/`--session-digest`.
     #[arg(long, value_enum, default_value_t = Level::Default)]
     level: Level,
@@ -98,6 +102,13 @@ struct Cli {
 #[value(rename_all = "kebab-case")]
 enum ForceKind {
     PlainText,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+#[value(rename_all = "kebab-case")]
+enum DedupeMethod {
+    MiniLM,
+    Cascade,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -197,6 +208,7 @@ fn route_with_level(
         ALLOW_PUNCTUATION_RESTORE_DEFAULT,
         false,
         level,
+        DedupeMethod::MiniLM,
     )
 }
 
@@ -213,6 +225,7 @@ fn route_with_override(text: &str, forced_kind: Option<ContentKind>) -> (Content
         ALLOW_PUNCTUATION_RESTORE_DEFAULT,
         false,
         Level::Default,
+        DedupeMethod::MiniLM,
     )
 }
 
@@ -224,6 +237,88 @@ fn ensure_dedup_loaded(cache: &mut Option<SemanticDedup>) -> Result<&mut Semanti
     Ok(cache.as_mut().unwrap())
 }
 
+/// Build output for semantic_dedup result.
+fn build_semantic_dedup_output(
+    result: &squishi::semantic_dedup::DedupResult,
+    include_embedding: bool,
+) -> Output {
+    use squishi::semantic_dedup::SentenceShape;
+    use serde_json::{json, Map, Value};
+
+    let stories: Vec<Value> = result
+        .kept
+        .iter()
+        .filter(|k| k.shape == SentenceShape::Narrative)
+        .map(|k| Value::from(k.text.clone()))
+        .collect();
+
+    let kept: Vec<Value> = result
+        .kept
+        .iter()
+        .map(|k| {
+            let mut m = Map::new();
+            m.insert("index".to_string(), Value::from(k.index));
+            m.insert("text".to_string(), Value::from(k.text.clone()));
+            m.insert(
+                "shape".to_string(),
+                Value::from(match k.shape {
+                    SentenceShape::Narrative => "narrative",
+                    SentenceShape::Concept => "concept",
+                }),
+            );
+            if include_embedding {
+                if let Some(embedding) = &k.embedding {
+                    m.insert(
+                        "embedding".to_string(),
+                        Value::from(
+                            embedding
+                                .iter()
+                                .map(|f| Value::from(*f))
+                                .collect::<Vec<_>>(),
+                        ),
+                    );
+                }
+            }
+            Value::Object(m)
+        })
+        .collect();
+
+    let traceability: Vec<Value> = result
+        .drops
+        .iter()
+        .map(|d| {
+            let mut m = Map::new();
+            m.insert("dropped_index".to_string(), Value::from(d.dropped_index));
+            m.insert("kept_index".to_string(), Value::from(d.kept_index));
+            m.insert("similarity".to_string(), Value::from(d.similarity));
+            Value::Object(m)
+        })
+        .collect();
+
+    Output {
+        detail: Map::from_iter([
+            (
+                "sentences_before".to_string(),
+                Value::from(result.original_sentences),
+            ),
+            (
+                "sentences_after".to_string(),
+                Value::from(result.kept_sentences),
+            ),
+            ("summary".to_string(), Value::from(result.summary.clone())),
+            ("stories".to_string(), Value::from(stories)),
+            ("kept".to_string(), Value::from(kept)),
+            ("drops".to_string(), Value::from(traceability)),
+            (
+                "punctuation_restored".to_string(),
+                Value::from(result.punctuation_restored),
+            ),
+        ]),
+        compressed: result.content.clone(),
+        source: "dedup+semantic",
+    }
+}
+
 fn route_impl(
     text: &str,
     forced_kind: Option<ContentKind>,
@@ -231,6 +326,7 @@ fn route_impl(
     allow_punctuation_restore: bool,
     include_embedding: bool,
     level: Level,
+    dedup_method: DedupeMethod,
 ) -> (ContentKind, Output) {
     // Claude Code's Read tool wraps file content in a `cat -n`-style `N\t<line>` prefix, which confuses both detect() and line-anchored fast-path regexes -- stripped before detection runs.
     let (text, line_numbers_stripped) = strip_read_tool_line_numbers(text);
@@ -345,6 +441,69 @@ fn route_impl(
                     source: "dedup",
                     detail: Map::new(),
                 }
+            } else if matches!(dedup_method, DedupeMethod::Cascade) {
+                // Use cascade dedup (simplified, no shape detection)
+                use squishi::cascade_dedup::{CascadeDedup, KeptSentence};
+                use squishi::semantic_dedup::split_sentences;
+
+                let sentences: Vec<&str> = split_sentences(&deduped);
+                match CascadeDedup::dedupe(sentences) {
+                    Ok(result) => {
+                        let kept: Vec<Value> = result
+                            .kept
+                            .iter()
+                            .map(|k| {
+                                let mut m = Map::new();
+                                m.insert("text".to_string(), Value::from(k.text.clone()));
+                                if include_embedding {
+                                    if let Some(embedding) = &k.embedding {
+                                        m.insert(
+                                            "embedding".to_string(),
+                                            Value::from(
+                                                embedding
+                                                    .iter()
+                                                    .map(|f| Value::from(*f))
+                                                    .collect::<Vec<_>>(),
+                                            ),
+                                        );
+                                    }
+                                }
+                                Value::Object(m)
+                            })
+                            .collect();
+
+                        let mut detail = Map::new();
+                        detail.insert("kept_count".to_string(), Value::from(result.kept.len()));
+                        detail.insert("removed_count".to_string(), Value::from(result.removed_count));
+                        detail.insert("stage1_ms".to_string(), Value::from(result.stage1_time_ms));
+                        detail.insert("stage2_ms".to_string(), Value::from(result.stage2_time_ms));
+                        detail.insert("stage3_ms".to_string(), Value::from(result.stage3_time_ms));
+                        detail.insert("kept".to_string(), Value::Array(kept));
+
+                        Output {
+                            compressed: result.kept.iter().map(|k| k.text.clone()).collect::<Vec<_>>().join(" "),
+                            source: "cascade",
+                            detail,
+                        }
+                    }
+                    Err(_) => {
+                        // Fallback to MiniLM on cascade failure
+                        match ensure_dedup_loaded(dedup_cache).and_then(|d| {
+                            d.dedupe(
+                                &deduped,
+                                configs.paraphrase_threshold,
+                                allow_punctuation_restore,
+                            )
+                        }) {
+                            Ok(result) => build_semantic_dedup_output(&result, include_embedding),
+                            Err(_) => Output {
+                                compressed: deduped,
+                                source: "error",
+                                detail: Map::new(),
+                            },
+                        }
+                    }
+                }
             } else {
                 match ensure_dedup_loaded(dedup_cache).and_then(|d| {
                     d.dedupe(
@@ -353,80 +512,11 @@ fn route_impl(
                         allow_punctuation_restore,
                     )
                 }) {
-                    Ok(result) => {
-                        let stories: Vec<Value> = result
-                            .kept
-                            .iter()
-                            .filter(|k| k.shape == SentenceShape::Narrative)
-                            .map(|k| Value::from(k.text.clone()))
-                            .collect();
-                        let kept: Vec<Value> = result
-                            .kept
-                            .iter()
-                            .map(|k| {
-                                let mut m = Map::new();
-                                m.insert("index".to_string(), Value::from(k.index));
-                                m.insert("text".to_string(), Value::from(k.text.clone()));
-                                m.insert(
-                                    "shape".to_string(),
-                                    Value::from(match k.shape {
-                                        SentenceShape::Narrative => "narrative",
-                                        SentenceShape::Concept => "concept",
-                                    }),
-                                );
-                                if include_embedding && let Some(embedding) = &k.embedding {
-                                    m.insert(
-                                        "embedding".to_string(),
-                                        Value::from(
-                                            embedding
-                                                .iter()
-                                                .map(|f| Value::from(*f))
-                                                .collect::<Vec<_>>(),
-                                        ),
-                                    );
-                                }
-                                Value::Object(m)
-                            })
-                            .collect();
-                        let traceability: Vec<Value> = result
-                            .drops
-                            .iter()
-                            .map(|d| {
-                                let mut m = Map::new();
-                                m.insert("dropped_index".to_string(), Value::from(d.dropped_index));
-                                m.insert("kept_index".to_string(), Value::from(d.kept_index));
-                                m.insert("similarity".to_string(), Value::from(d.similarity));
-                                Value::Object(m)
-                            })
-                            .collect();
-                        Output {
-                            detail: Map::from_iter([
-                                (
-                                    "sentences_before".to_string(),
-                                    Value::from(result.original_sentences),
-                                ),
-                                (
-                                    "sentences_after".to_string(),
-                                    Value::from(result.kept_sentences),
-                                ),
-                                ("summary".to_string(), Value::from(result.summary)),
-                                ("stories".to_string(), Value::from(stories)),
-                                ("kept".to_string(), Value::from(kept)),
-                                ("drops".to_string(), Value::from(traceability)),
-                                (
-                                    "punctuation_restored".to_string(),
-                                    Value::from(result.punctuation_restored),
-                                ),
-                            ]),
-                            compressed: result.content,
-                            source: "dedup+semantic",
-                        }
-                    }
-                    // Model unavailable (offline, first-run download failed) -- line-dedup's result is still real compression, use it rather than failing outright.
-                    Err(e) => Output {
+                    Ok(result) => build_semantic_dedup_output(&result, include_embedding),
+                    Err(_) => Output {
                         compressed: deduped,
-                        source: "dedup-semantic-unavailable",
-                        detail: Map::from_iter([("semantic_error".to_string(), Value::from(e))]),
+                        source: "error",
+                        detail: Map::new(),
                     },
                 }
             }
@@ -804,6 +894,7 @@ fn main() {
                 allow_punctuation_restore,
                 include_embedding,
                 cli.level,
+                cli.dedup_method,
             );
             let mut json = build_output(&item_text, &kind, output);
             json.insert("id".to_string(), Value::from(id));

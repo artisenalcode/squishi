@@ -90,7 +90,7 @@ fn split_by_word_window(content: &str, window: usize) -> Vec<&str> {
 }
 
 /// Real sentence split when punctuated, word-window fallback otherwise (see `SemanticDedup::dedupe` for the primary punctuation-restoration path this is the fallback tier of).
-fn split_sentences(content: &str) -> Vec<&str> {
+pub fn split_sentences(content: &str) -> Vec<&str> {
     if is_effectively_unpunctuated(content) {
         split_by_word_window(content, FALLBACK_WINDOW_WORDS)
     } else {
