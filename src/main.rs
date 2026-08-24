@@ -81,8 +81,8 @@ struct Cli {
     #[arg(long)]
     batch: bool,
 
-    /// Deduplication method: `minilm` (default, MiniLM transformer) or `cascade` (three-stage fast pipeline). Only affects plain-text dedup.
-    #[arg(long, value_enum, default_value_t = DedupeMethod::MiniLM)]
+    /// Deduplication method: `cascade` (default, 42x faster three-stage pipeline) or `mini-lm` (MiniLM transformer). Only affects plain-text dedup.
+    #[arg(long, value_enum, default_value_t = DedupeMethod::Cascade)]
     dedup_method: DedupeMethod,
 
     /// How hard each compressor pushes: `conservative` keeps more context (safer, smaller savings), `aggressive` cuts harder (bigger savings, more loss). Applies to the default path and `--batch`; not read by `--session-prune`/`--session-digest`.
