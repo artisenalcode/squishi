@@ -10,7 +10,6 @@ use squishi::line_dedup::dedupe_line_runs;
 use squishi::line_number_strip::strip_read_tool_line_numbers;
 use squishi::log_compress::{LogCompressConfig, compress_log};
 use squishi::search_compress::compress_search_results;
-use squishi::semantic_dedup::{SemanticDedup, SentenceShape};
 use squishi::session_digest;
 use squishi::session_prune;
 use squishi::session_stats;
@@ -81,10 +80,6 @@ struct Cli {
     #[arg(long)]
     batch: bool,
 
-    /// Deduplication method: `cascade` (default, 42x faster three-stage pipeline) or `mini-lm` (MiniLM transformer). Only affects plain-text dedup.
-    #[arg(long, value_enum, default_value_t = DedupeMethod::Cascade)]
-    dedup_method: DedupeMethod,
-
     /// How hard each compressor pushes: `conservative` keeps more context (safer, smaller savings), `aggressive` cuts harder (bigger savings, more loss). Applies to the default path and `--batch`; not read by `--session-prune`/`--session-digest`.
     #[arg(long, value_enum, default_value_t = Level::Default)]
     level: Level,
@@ -104,12 +99,6 @@ enum ForceKind {
     PlainText,
 }
 
-#[derive(clap::ValueEnum, Clone, Copy, Debug)]
-#[value(rename_all = "kebab-case")]
-enum DedupeMethod {
-    MiniLM,
-    Cascade,
-}
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 #[value(rename_all = "kebab-case")]
@@ -200,133 +189,36 @@ fn route_with_level(
     forced_kind: Option<ContentKind>,
     level: Level,
 ) -> (ContentKind, Output) {
-    let mut dedup_cache = None;
     route_impl(
         text,
         forced_kind,
-        &mut dedup_cache,
         ALLOW_PUNCTUATION_RESTORE_DEFAULT,
         false,
         level,
-        DedupeMethod::MiniLM,
     )
 }
 
 /// Same eligibility gate `SemanticDedup::dedupe` takes -- see its own doc comment.
 const ALLOW_PUNCTUATION_RESTORE_DEFAULT: bool = true;
 
-/// Same as `route`, but `forced_kind` -- when given -- skips `detect()` entirely for a caller that already knows the content's shape, rather than trusting a heuristic that can misclassify it. Single-shot: loads its own `SemanticDedup` fresh every call; see `--batch` for the reused-model path.
+/// Same as `route`, but `forced_kind` -- when given -- skips `detect()` entirely for a caller that already knows the content's shape, rather than trusting a heuristic that can misclassify it.
 fn route_with_override(text: &str, forced_kind: Option<ContentKind>) -> (ContentKind, Output) {
-    let mut dedup_cache = None;
     route_impl(
         text,
         forced_kind,
-        &mut dedup_cache,
         ALLOW_PUNCTUATION_RESTORE_DEFAULT,
         false,
         Level::Default,
-        DedupeMethod::MiniLM,
     )
 }
 
-/// Loads `SemanticDedup` into `cache` on first need, reused on every subsequent call -- `--batch` shares one cache across an entire run instead of reloading the model per item.
-fn ensure_dedup_loaded(cache: &mut Option<SemanticDedup>) -> Result<&mut SemanticDedup, String> {
-    if cache.is_none() {
-        *cache = Some(SemanticDedup::load()?);
-    }
-    Ok(cache.as_mut().unwrap())
-}
-
-/// Build output for semantic_dedup result.
-fn build_semantic_dedup_output(
-    result: &squishi::semantic_dedup::DedupResult,
-    include_embedding: bool,
-) -> Output {
-    use squishi::semantic_dedup::SentenceShape;
-    use serde_json::{json, Map, Value};
-
-    let stories: Vec<Value> = result
-        .kept
-        .iter()
-        .filter(|k| k.shape == SentenceShape::Narrative)
-        .map(|k| Value::from(k.text.clone()))
-        .collect();
-
-    let kept: Vec<Value> = result
-        .kept
-        .iter()
-        .map(|k| {
-            let mut m = Map::new();
-            m.insert("index".to_string(), Value::from(k.index));
-            m.insert("text".to_string(), Value::from(k.text.clone()));
-            m.insert(
-                "shape".to_string(),
-                Value::from(match k.shape {
-                    SentenceShape::Narrative => "narrative",
-                    SentenceShape::Concept => "concept",
-                }),
-            );
-            if include_embedding {
-                if let Some(embedding) = &k.embedding {
-                    m.insert(
-                        "embedding".to_string(),
-                        Value::from(
-                            embedding
-                                .iter()
-                                .map(|f| Value::from(*f))
-                                .collect::<Vec<_>>(),
-                        ),
-                    );
-                }
-            }
-            Value::Object(m)
-        })
-        .collect();
-
-    let traceability: Vec<Value> = result
-        .drops
-        .iter()
-        .map(|d| {
-            let mut m = Map::new();
-            m.insert("dropped_index".to_string(), Value::from(d.dropped_index));
-            m.insert("kept_index".to_string(), Value::from(d.kept_index));
-            m.insert("similarity".to_string(), Value::from(d.similarity));
-            Value::Object(m)
-        })
-        .collect();
-
-    Output {
-        detail: Map::from_iter([
-            (
-                "sentences_before".to_string(),
-                Value::from(result.original_sentences),
-            ),
-            (
-                "sentences_after".to_string(),
-                Value::from(result.kept_sentences),
-            ),
-            ("summary".to_string(), Value::from(result.summary.clone())),
-            ("stories".to_string(), Value::from(stories)),
-            ("kept".to_string(), Value::from(kept)),
-            ("drops".to_string(), Value::from(traceability)),
-            (
-                "punctuation_restored".to_string(),
-                Value::from(result.punctuation_restored),
-            ),
-        ]),
-        compressed: result.content.clone(),
-        source: "dedup+semantic",
-    }
-}
 
 fn route_impl(
     text: &str,
     forced_kind: Option<ContentKind>,
-    dedup_cache: &mut Option<SemanticDedup>,
     allow_punctuation_restore: bool,
     include_embedding: bool,
     level: Level,
-    dedup_method: DedupeMethod,
 ) -> (ContentKind, Output) {
     // Claude Code's Read tool wraps file content in a `cat -n`-style `N\t<line>` prefix, which confuses both detect() and line-anchored fast-path regexes -- stripped before detection runs.
     let (text, line_numbers_stripped) = strip_read_tool_line_numbers(text);
@@ -441,9 +333,9 @@ fn route_impl(
                     source: "dedup",
                     detail: Map::new(),
                 }
-            } else if matches!(dedup_method, DedupeMethod::Cascade) {
+            } else {
                 // Use cascade dedup (simplified, no shape detection)
-                use squishi::cascade_dedup::{CascadeDedup, KeptSentence};
+                use squishi::cascade_dedup::CascadeDedup;
                 use squishi::semantic_dedup::split_sentences;
 
                 let sentences: Vec<&str> = split_sentences(&deduped);
@@ -486,33 +378,6 @@ fn route_impl(
                             detail,
                         }
                     }
-                    Err(_) => {
-                        // Fallback to MiniLM on cascade failure
-                        match ensure_dedup_loaded(dedup_cache).and_then(|d| {
-                            d.dedupe(
-                                &deduped,
-                                configs.paraphrase_threshold,
-                                allow_punctuation_restore,
-                            )
-                        }) {
-                            Ok(result) => build_semantic_dedup_output(&result, include_embedding),
-                            Err(_) => Output {
-                                compressed: deduped,
-                                source: "error",
-                                detail: Map::new(),
-                            },
-                        }
-                    }
-                }
-            } else {
-                match ensure_dedup_loaded(dedup_cache).and_then(|d| {
-                    d.dedupe(
-                        &deduped,
-                        configs.paraphrase_threshold,
-                        allow_punctuation_restore,
-                    )
-                }) {
-                    Ok(result) => build_semantic_dedup_output(&result, include_embedding),
                     Err(_) => Output {
                         compressed: deduped,
                         source: "error",
@@ -884,17 +749,14 @@ fn main() {
             }
         };
 
-        let mut dedup_cache = None;
         let mut results = Vec::with_capacity(items.len());
         for (id, item_text, allow_punctuation_restore, include_embedding) in items {
             let (kind, output) = route_impl(
                 &item_text,
                 forced.clone(),
-                &mut dedup_cache,
                 allow_punctuation_restore,
                 include_embedding,
                 cli.level,
-                cli.dedup_method,
             );
             let mut json = build_output(&item_text, &kind, output);
             json.insert("id".to_string(), Value::from(id));
@@ -996,16 +858,6 @@ mod tests {
         assert_eq!(parse_batch_items("[]").unwrap(), Vec::new());
     }
 
-    #[test]
-    #[ignore] // real model load attempt (network/cache)
-    fn ensure_dedup_loaded_reuses_the_same_cache_across_calls() {
-        // Proves the cache slot is threaded through, not silently re-created on a second call, whether the first load succeeded or failed.
-        let mut cache: Option<SemanticDedup> = None;
-        let first = ensure_dedup_loaded(&mut cache);
-        let first_was_ok = first.is_ok();
-        let second = ensure_dedup_loaded(&mut cache);
-        assert_eq!(second.is_ok(), first_was_ok);
-    }
 
     #[test]
     fn json_array_routes_to_json_compressor() {
